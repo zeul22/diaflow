@@ -73,7 +73,7 @@ function isPrediction(value, allowedLabels) {
   );
 }
 
-function isAnalysisResponse(value) {
+export function isAnalysisResponse(value) {
   return Boolean(
     value &&
       typeof value === "object" &&

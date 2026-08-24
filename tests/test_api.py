@@ -3,6 +3,8 @@ from __future__ import annotations
 from uuid import uuid4
 
 import numpy as np
+import pytest
+from starlette.websockets import WebSocketDisconnect
 
 from tests.conftest import FakeEstimator, speechlike_pcm, wav_bytes
 
@@ -129,7 +131,50 @@ def test_websocket_emits_progressive_and_final_predictions(client) -> None:
         final = websocket.receive_json()
         assert final["type"] == "prediction"
         assert final["is_final"] is True
-        assert final["sequence"] == progressive["sequence"] + 1
+    assert final["sequence"] == progressive["sequence"] + 1
+
+
+def test_websocket_accepts_configured_browser_origin(client) -> None:
+    with client.websocket_connect(
+        "/ws/analyze", headers={"Origin": "http://localhost:3000"}
+    ) as websocket:
+        websocket.send_json(
+            {
+                "type": "start",
+                "encoding": "pcm_s16le",
+                "sample_rate": 16_000,
+                "channels": 1,
+            }
+        )
+        websocket.send_json({"type": "ping"})
+        assert websocket.receive_json() == {"type": "pong"}
+
+
+def test_websocket_accepts_originless_server_client(client) -> None:
+    with client.websocket_connect("/ws/analyze") as websocket:
+        websocket.send_json(
+            {
+                "type": "start",
+                "encoding": "pcm_s16le",
+                "sample_rate": 16_000,
+                "channels": 1,
+            }
+        )
+        websocket.send_json({"type": "ping"})
+        assert websocket.receive_json() == {"type": "pong"}
+
+
+def test_websocket_rejects_unconfigured_browser_origin(client) -> None:
+    with (
+        pytest.raises(WebSocketDisconnect) as exception,
+        client.websocket_connect(
+            "/ws/analyze", headers={"Origin": "https://attacker.example"}
+        ),
+    ):
+        pass
+
+    assert exception.value.code == 1008
+    assert exception.value.reason == "WS_ORIGIN_FORBIDDEN"
 
 
 def test_websocket_rejects_non_object_control_message(client) -> None:

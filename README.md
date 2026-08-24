@@ -8,7 +8,7 @@ A request-scoped FastAPI service that estimates an adult caller's perceived bina
 
 - `POST /analyze` for raw HTTP bodies and streaming-parsed multipart uploads.
 - `WS /ws/analyze` for progressive predictions over raw PCM, μ-law, or A-law chunks.
-- A responsive React/Vite/SCSS web client for drag-and-drop upload, preview, results, and actionable error states.
+- A responsive React/Vite/SCSS web client for upload, record-then-analyze, raw-PCM live streaming, progressive results, and actionable error states.
 - Native WAV/PCM/G.711 decoding plus FFmpeg fallback for common compressed containers and codecs.
 - Quality gating for short, quiet, non-speech, noisy, clipped, low-frequency-heavy, and narrowband input.
 - One pinned SpeechBrain ECAPA-TDNN encoder pass shared by Apache-2.0 griko SVM/SVR attribute heads.
@@ -38,17 +38,24 @@ Both should return HTTP 200. Interactive OpenAPI documentation is available at `
 
 Open the web interface at [http://localhost:3000](http://localhost:3000). Select or drag in an M4A, WAV, MP3, OGG, FLAC, or WebM recording; the browser sends it directly to the service without storing it. Compressed recordings such as M4A are accepted through the backend's FFmpeg decoder and may be conservatively marked `degraded`.
 
+The **Record** mode captures a complete browser-supported clip and analyzes it through REST. **Live** uses an AudioWorklet to send raw microphone PCM in roughly 250 ms WebSocket frames and replaces provisional estimates until the final result arrives. Microphone access works over localhost for development and requires HTTPS/WSS when deployed. See [docs/STREAMING.md](docs/STREAMING.md) for the browser and real call-media designs.
+
 Run a dependency-free synthetic contract smoke test from another terminal:
 
 ```bash
 make smoke
 ```
 
-After installing the project development dependencies, verify progressive
-streaming as well:
+Verify progressive streaming with the containerized smoke client:
 
 ```bash
 make smoke-ws
+```
+
+Exercise WebSocket streaming through the same reverse proxy used by the browser:
+
+```bash
+make smoke-ws-ui
 ```
 
 Verify the same REST contract through the frontend reverse proxy:
@@ -106,7 +113,7 @@ curl -sS -X POST \
 
 ## Frontend development
 
-The production frontend is built into a small Nginx container and proxies only the analyzer, readiness, and WebSocket paths to FastAPI. Browser requests remain same-origin, so the backend does not need permissive CORS settings. The backend port and UI port are bound to loopback by default.
+The production frontend is built into a small Nginx container and proxies only the analyzer, readiness, and WebSocket paths to FastAPI. Browser requests remain same-origin, so the backend does not need permissive CORS settings. Its permissions policy allows microphone access only to the same origin. The backend port and UI port are bound to loopback by default.
 
 For Vite hot reload, keep the backend running and start the development server in another terminal:
 
@@ -154,6 +161,7 @@ Docker Compose provides safe CPU defaults. Important environment variables are:
 | `REQUEST_IDLE_TIMEOUT_SECONDS` | `10.0` | Maximum wait between HTTP request-body chunks. |
 | `WS_IDLE_TIMEOUT_SECONDS` | `30.0` | Maximum wait between WebSocket frames after start. |
 | `WS_MAX_SESSION_SECONDS` | `120.0` | Hard wall-clock limit for one WebSocket session. |
+| `WS_ALLOWED_ORIGINS` | local UI origins | Comma-separated browser origins allowed to open WebSockets; origin-less server adapters remain supported. |
 | `LOG_LEVEL` | `INFO` | JSON log level. |
 
 Invalid configuration fails startup. Keep the default one Uvicorn worker per container so the model is loaded once per replica; scale with more containers.
@@ -216,6 +224,7 @@ Before production, add TLS at the ingress, authentication, tenant authorization,
 - [Model-selection decision record](docs/ADR-001-model-selection.md)
 - [200-word design write-up](docs/DESIGN.md)
 - [Privacy and data lifecycle](docs/PRIVACY.md)
+- [Browser and telephony streaming design](docs/STREAMING.md)
 - [Model card and limitations](docs/MODEL_CARD.md)
 - [Sample audio instructions](samples/README.md)
 - [Third-party model notices](THIRD_PARTY_NOTICES.md)

@@ -42,6 +42,8 @@ Application behavior:
 - Mutable encoded buffers are overwritten with zeros and cleared. Decoded and selected NumPy arrays are filled with zeros in `finally`, including error paths after decoding.
 - The application does not cache waveforms, embeddings, model outputs, or contact profiles.
 - The API response returns `contact_id`; normal logs exclude it and all predictions.
+- The browser requests microphone permission only after an explicit user action. A completed recording blob remains only in the current page state while selected. Live PCM is held in one roughly 250 ms application batch, a browser WebSocket queue bounded to 512 KiB before the client fails closed, and the backend's bounded active-session buffer. Mode changes, cancellation, errors, and teardown release browser tracks, nodes, arrays, sockets, timers, and object URLs on a best-effort basis.
+- Live capture does not automatically reconnect or replay. Reconstructing a cumulative session would require retaining caller audio, so a failed live session must be restarted explicitly.
 
 ## What zeroization does not guarantee
 

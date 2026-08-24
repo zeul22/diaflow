@@ -156,6 +156,8 @@ Prediction messages extend the REST response:
 
 Progressive predictions have `is_final=false`; the response to `end` is final and the server closes with code 1000. Each prediction re-analyzes the cumulative buffer, so it may change. Clients should treat only the final prediction as settled.
 
+Browser `MediaRecorder` chunks are normally compressed WebM/Opus or MP4/AAC container fragments and must not be sent to this endpoint. The supplied live frontend uses an `AudioWorklet`, declares `pcm_f32le` at the browser's actual `AudioContext` rate, and batches mono raw samples into approximately 250 ms binary frames. See [STREAMING.md](STREAMING.md). A completed MediaRecorder blob can instead be uploaded to `POST /analyze`.
+
 Create headerless input:
 
 ```bash
@@ -203,7 +205,7 @@ async def main():
 asyncio.run(main())
 ```
 
-WebSocket service errors are sent as `{"type":"error","error":{...}}`, followed by close code 1009 for size limits, 1013 for service unavailability, or 1008 for protocol/validation errors. Abrupt disconnects are silently cleaned up.
+WebSocket service errors are sent as `{"type":"error","error":{...}}`, followed by close code 1009 for size limits, 1013 for service unavailability, or 1008 for protocol/validation errors. Browser handshakes with an `Origin` outside `WS_ALLOWED_ORIGINS` are rejected before acceptance; clients without an `Origin` remain available for authenticated server-side telephony adapters. Abrupt disconnects are silently cleaned up.
 
 ## Operational endpoints
 

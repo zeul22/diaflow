@@ -5,6 +5,7 @@ import { StrictMode } from "react";
 
 import App from "./App.jsx";
 import { MAX_AUDIO_BYTES } from "./api/analyze.js";
+import { LiveAnalysisSession } from "./api/streamAnalysis.js";
 
 function response(payload, { ok = true, status = 200, requestId = "request-123" } = {}) {
   return {
@@ -44,6 +45,57 @@ function mockAnalyzer(analyzerPromise = Promise.resolve(response(successfulResul
 
 function analyzerCalls(fetchMock) {
   return fetchMock.mock.calls.filter(([url]) => url === "/api/analyze");
+}
+
+function installRecorderBrowser({ getUserMediaImpl } = {}) {
+  const track = { stop: vi.fn() };
+  const stream = { getTracks: () => [track] };
+  const getUserMedia = vi.fn(
+    getUserMediaImpl || (() => Promise.resolve(stream)),
+  );
+  const instances = [];
+  vi.stubGlobal("navigator", {
+    clipboard: { writeText: vi.fn() },
+    mediaDevices: { getUserMedia },
+  });
+
+  class TestMediaRecorder extends EventTarget {
+    static isTypeSupported(type) {
+      return type === "audio/webm;codecs=opus";
+    }
+
+    constructor() {
+      super();
+      this.mimeType = "audio/webm;codecs=opus";
+      this.state = "inactive";
+      instances.push(this);
+    }
+
+    start() {
+      this.state = "recording";
+    }
+
+    stop() {
+      this.state = "inactive";
+      const dataEvent = new Event("dataavailable");
+      Object.defineProperty(dataEvent, "data", {
+        value: new Blob(["recorded caller audio"], { type: this.mimeType }),
+      });
+      this.dispatchEvent(dataEvent);
+      this.dispatchEvent(new Event("stop"));
+    }
+  }
+  vi.stubGlobal("MediaRecorder", TestMediaRecorder);
+  return { getUserMedia, instances, stream, track };
+}
+
+function installLiveSupport() {
+  vi.stubGlobal("navigator", {
+    clipboard: { writeText: vi.fn() },
+    mediaDevices: { getUserMedia: vi.fn() },
+  });
+  vi.stubGlobal("AudioContext", class TestAudioContext {});
+  vi.stubGlobal("AudioWorkletNode", class TestAudioWorkletNode {});
 }
 
 describe("Audio analyzer", () => {
@@ -183,5 +235,144 @@ describe("Audio analyzer", () => {
     await user.click(screen.getByRole("button", { name: /analyze audio/i }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent("unexpected response");
+  });
+
+  it("records microphone audio and reuses the REST analysis flow", async () => {
+    const user = userEvent.setup();
+    const fetchMock = mockAnalyzer();
+    const { getUserMedia, track } = installRecorderBrowser();
+    renderApp();
+
+    await user.click(screen.getByRole("radio", { name: /^record/i }));
+    expect(screen.getByRole("heading", { name: "Record caller audio" })).toBeVisible();
+    expect(getUserMedia).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: /start recording/i }));
+    expect(await screen.findByText("Recording in progress")).toBeVisible();
+    expect(getUserMedia).toHaveBeenCalledTimes(1);
+
+    await user.click(screen.getByRole("button", { name: /stop recording/i }));
+    expect(await screen.findByRole("button", { name: /analyze recording/i })).toBeEnabled();
+    expect(screen.getByText(/microphone-.*\.webm/i)).toBeVisible();
+    expect(track.stop).toHaveBeenCalledTimes(1);
+
+    await user.click(screen.getByRole("button", { name: /analyze recording/i }));
+    expect(await screen.findByRole("heading", { name: /contact attributes/i })).toBeVisible();
+    const calls = analyzerCalls(fetchMock);
+    expect(calls).toHaveLength(1);
+    expect(calls[0][1].body.get("audio").type).toBe("audio/webm;codecs=opus");
+  });
+
+  it("can cancel an ignored microphone permission request without later restarting", async () => {
+    const user = userEvent.setup();
+    mockAnalyzer();
+    let resolvePermission;
+    const pendingPermission = new Promise((resolve) => {
+      resolvePermission = resolve;
+    });
+    const { stream, track } = installRecorderBrowser({
+      getUserMediaImpl: () => pendingPermission,
+    });
+    renderApp();
+
+    await user.click(screen.getByRole("radio", { name: /^record/i }));
+    await user.click(screen.getByRole("button", { name: /start recording/i }));
+    expect(screen.getByRole("button", { name: /cancel request/i })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: /cancel request/i }));
+    expect(screen.getByRole("button", { name: /start recording/i })).toBeEnabled();
+
+    resolvePermission(stream);
+    await waitFor(() => expect(track.stop).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole("button", { name: /start recording/i })).toBeEnabled();
+    expect(screen.queryByText("Recording in progress")).not.toBeInTheDocument();
+  });
+
+  it("exits recording and releases the microphone after a recorder runtime error", async () => {
+    const user = userEvent.setup();
+    mockAnalyzer();
+    const { instances, track } = installRecorderBrowser();
+    renderApp();
+
+    await user.click(screen.getByRole("radio", { name: /^record/i }));
+    await user.click(screen.getByRole("button", { name: /start recording/i }));
+    expect(await screen.findByText("Recording in progress")).toBeVisible();
+
+    const failure = new Error("device disappeared");
+    failure.name = "NotReadableError";
+    const errorEvent = new Event("error");
+    Object.defineProperty(errorEvent, "error", { value: failure });
+    instances[0].state = "inactive";
+    instances[0].dispatchEvent(errorEvent);
+    instances[0].dispatchEvent(new Event("stop"));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "microphone is busy or unavailable",
+    );
+    expect(screen.getByRole("button", { name: /start recording/i })).toBeEnabled();
+    expect(track.stop).toHaveBeenCalledTimes(1);
+  });
+
+  it("shows provisional live updates and settles the final WebSocket result", async () => {
+    const user = userEvent.setup();
+    mockAnalyzer();
+    installLiveSupport();
+    const progressive = {
+      ...successfulResult,
+      type: "prediction",
+      sequence: 1,
+      is_final: false,
+    };
+    const final = { ...progressive, sequence: 2, is_final: true };
+    vi.spyOn(LiveAnalysisSession.prototype, "start").mockImplementation(async function () {
+      this.onState("streaming");
+      this.onStats({ bytes: 16000, chunks: 2, elapsed: 1.5, level: 0.45, sampleRate: 48000 });
+      this.onPrediction(progressive);
+    });
+    vi.spyOn(LiveAnalysisSession.prototype, "finish").mockImplementation(async function () {
+      this.onPrediction(final);
+      this.onState("complete");
+    });
+
+    renderApp();
+    await user.click(screen.getByRole("radio", { name: /^live/i }));
+    await user.click(screen.getByRole("button", { name: /start live analysis/i }));
+
+    expect(await screen.findByText("Estimate may change")).toBeVisible();
+    expect(screen.getByText(/live · update 1/i)).toBeVisible();
+    expect(screen.getByText(/2 raw pcm chunks/i)).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: /stop & finalize/i }));
+    expect(await screen.findByText("Final result")).toBeVisible();
+    expect(screen.getByRole("button", { name: /analyze another/i })).toBeEnabled();
+  });
+
+  it("does not let a slow cancelled session clobber a newly started live session", async () => {
+    const user = userEvent.setup();
+    mockAnalyzer();
+    installLiveSupport();
+    let releaseFirstCancel;
+    const firstCancel = new Promise((resolve) => {
+      releaseFirstCancel = resolve;
+    });
+    const start = vi
+      .spyOn(LiveAnalysisSession.prototype, "start")
+      .mockImplementation(async function () {
+        this.onState("streaming");
+      });
+    vi.spyOn(LiveAnalysisSession.prototype, "cancel")
+      .mockImplementationOnce(() => firstCancel)
+      .mockResolvedValue(undefined);
+
+    renderApp();
+    await user.click(screen.getByRole("radio", { name: /^live/i }));
+    await user.click(screen.getByRole("button", { name: /start live analysis/i }));
+    await user.click(screen.getByRole("button", { name: /cancel stream/i }));
+    await user.click(screen.getByRole("button", { name: /start live analysis/i }));
+
+    expect(start).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("button", { name: /stop & finalize/i })).toBeEnabled();
+    releaseFirstCancel();
+    await Promise.resolve();
+    expect(screen.getByRole("button", { name: /stop & finalize/i })).toBeEnabled();
   });
 });

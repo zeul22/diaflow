@@ -4,6 +4,7 @@ import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -49,6 +50,12 @@ class Settings:
     request_idle_timeout_seconds: float = 10.0
     ws_idle_timeout_seconds: float = 30.0
     ws_max_session_seconds: float = 120.0
+    ws_allowed_origins: tuple[str, ...] = (
+        "http://127.0.0.1:3000",
+        "http://localhost:3000",
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+    )
     ffmpeg_binary: str = "ffmpeg"
     log_level: str = "INFO"
 
@@ -132,6 +139,13 @@ class Settings:
             ws_max_session_seconds=float(
                 os.getenv("WS_MAX_SESSION_SECONDS", defaults.ws_max_session_seconds)
             ),
+            ws_allowed_origins=tuple(
+                origin.strip().lower().rstrip("/")
+                for origin in os.getenv(
+                    "WS_ALLOWED_ORIGINS", ",".join(defaults.ws_allowed_origins)
+                ).split(",")
+                if origin.strip()
+            ),
             ffmpeg_binary=os.getenv("FFMPEG_BINARY", defaults.ffmpeg_binary),
             log_level=os.getenv("LOG_LEVEL", defaults.log_level).upper(),
         )
@@ -188,3 +202,15 @@ class Settings:
         ):
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{field_name} must be finite and positive")
+        for origin in self.ws_allowed_origins:
+            parsed = urlsplit(origin)
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.netloc
+                or parsed.path not in {"", "/"}
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError(
+                    "WS_ALLOWED_ORIGINS must contain comma-separated HTTP(S) origins"
+                )

@@ -23,3 +23,28 @@ def test_invalid_timeout_configuration_fails_startup(field, value) -> None:
 
     with pytest.raises(ValueError):
         settings.validate()
+
+
+@pytest.mark.parametrize(
+    "origin",
+    ["ws://voice.example", "https://voice.example/path", "voice.example"],
+)
+def test_invalid_websocket_origin_configuration_fails_startup(origin) -> None:
+    settings = replace(Settings(), ws_allowed_origins=(origin,))
+
+    with pytest.raises(ValueError, match="WS_ALLOWED_ORIGINS"):
+        settings.validate()
+
+
+def test_websocket_origins_are_normalized_from_environment(monkeypatch) -> None:
+    monkeypatch.setenv(
+        "WS_ALLOWED_ORIGINS",
+        " HTTPS://VOICE.EXAMPLE/ , http://localhost:3000 ",
+    )
+
+    settings = Settings.from_env()
+
+    assert settings.ws_allowed_origins == (
+        "https://voice.example",
+        "http://localhost:3000",
+    )

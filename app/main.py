@@ -323,6 +323,14 @@ async def _handle_websocket(websocket: WebSocket, settings: Settings) -> None:
     completed = False
     started_at = time.perf_counter()
     try:
+        origin = websocket.headers.get("origin")
+        if origin and origin.lower().rstrip("/") not in settings.ws_allowed_origins:
+            logger.warning(
+                "websocket_origin_rejected",
+                extra={"event_data": {"request_id": request_id}},
+            )
+            await websocket.close(code=1008, reason="WS_ORIGIN_FORBIDDEN")
+            return
         await websocket.accept(headers=[(b"x-request-id", request_id.encode("ascii"))])
         accepted = True
         start = await _receive_start(websocket, settings.ws_start_timeout_seconds)

@@ -12,7 +12,11 @@ import struct
 import websockets
 
 
-def synthetic_pcm(duration: float = 2.4, sample_rate: int = 16_000) -> bytes:
+def synthetic_pcm(
+    duration: float = 2.4,
+    sample_rate: int = 16_000,
+    encoding: str = "pcm_s16le",
+) -> bytes:
     frames = bytearray()
     for index in range(int(duration * sample_rate)):
         time = index / sample_rate
@@ -25,19 +29,24 @@ def synthetic_pcm(duration: float = 2.4, sample_rate: int = 16_000) -> bytes:
             + 0.13 * math.sin(2.0 * phase)
             + 0.08 * math.sin(3.0 * phase)
         )
-        frames.extend(struct.pack("<h", max(-32768, min(32767, int(sample * 32767)))))
+        if encoding == "pcm_f32le":
+            frames.extend(struct.pack("<f", sample))
+        else:
+            frames.extend(
+                struct.pack("<h", max(-32768, min(32767, int(sample * 32767))))
+            )
     return bytes(frames)
 
 
-async def run(url: str) -> None:
-    audio = synthetic_pcm()
-    one_second = 16_000 * 2
+async def run(url: str, encoding: str) -> None:
+    audio = synthetic_pcm(encoding=encoding)
+    one_second = 16_000 * (4 if encoding == "pcm_f32le" else 2)
     async with websockets.connect(url, ping_interval=None) as socket:
         await socket.send(
             json.dumps(
                 {
                     "type": "start",
-                    "encoding": "pcm_s16le",
+                    "encoding": encoding,
                     "sample_rate": 16_000,
                     "channels": 1,
                 }
@@ -61,8 +70,13 @@ async def run(url: str) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="ws://127.0.0.1:8000/ws/analyze")
+    parser.add_argument(
+        "--encoding",
+        choices=("pcm_s16le", "pcm_f32le"),
+        default="pcm_s16le",
+    )
     args = parser.parse_args()
-    asyncio.run(run(args.url))
+    asyncio.run(run(args.url, args.encoding))
 
 
 if __name__ == "__main__":
