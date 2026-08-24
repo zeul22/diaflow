@@ -8,8 +8,10 @@ A FastAPI service that estimates an adult caller's perceived binary voice presen
 
 ## What is implemented
 
-- `POST /analyze` for raw HTTP bodies and streaming-parsed multipart uploads.
-- `WS /ws/analyze` for progressive predictions over raw PCM, μ-law, or A-law chunks.
+- `POST /v1/analyze` for raw HTTP bodies and streaming-parsed multipart uploads.
+- `WS /v1/ws/analyze` for progressive predictions over raw PCM, μ-law, or A-law chunks.
+- Unversioned paths remain mounted as deprecated aliases; `/healthz`, `/readyz` and `/metrics` are unversioned by design.
+- Per-client rate limiting (429 / WebSocket 1013) and baseline security headers. TLS terminates at the ingress, not in the app.
 - A responsive React/Vite/SCSS web client for upload, record-then-analyze, raw-PCM live streaming, progressive results, and actionable error states.
 - Per-request `none`, `result`, and consent-gated `result_and_audio` persistence modes; `none` is always the default.
 - PostgreSQL manifests plus S3 audio objects, one-second physical WebSocket segments, logical chunk offsets/checksums, history, and delete-now controls.
@@ -21,7 +23,7 @@ A FastAPI service that estimates an adult caller's perceived binary voice presen
 - JSON logs, request IDs, Prometheus metrics, liveness/readiness probes, and graceful structured errors.
 - A multi-stage, non-root, read-only Docker image. Model weights are downloaded only while building the image.
 
-Language/accent detection is not implemented in this version. A Common Voice evaluation harness is included for accuracy, coverage, confusion, and calibration checks.
+Optional best-effort spoken-language identification is available behind `LANGUAGE_BACKEND=voxlingua_ecapa`, using a pinned Apache-2.0 VoxLingua107 ECAPA classifier. It is off by default because it needs its own encoder pass. Accent and dialect detection are deliberately not offered; see [ADR-004](backend/docs/ADR-004-language-identification.md). A Common Voice evaluation harness is included for accuracy, coverage, confusion, and calibration checks.
 
 ## Repository layout
 
@@ -184,7 +186,9 @@ During the Docker build, every model file is fetched from an immutable commit an
 
 ## Confidence and quality
 
-Gender confidence is the selected SVM class probability after normalization and quality discounting. Age is first regressed in years, mapped to an adult bracket, and assigned probability mass using a configurable ten-year residual sigma. Implausible estimates outside 18–120 abstain. A degraded signal multiplies both scores by `0.75`. Scores below their thresholds become `unknown` with confidence `0.0`; insufficient audio skips model inference entirely. Compressed audio is degraded only when probed source metadata is missing/narrowband or measured signal checks warrant it—not merely because FFmpeg decoded it.
+Gender confidence is the selected SVM class score after normalization. In this baseline it is an uncalibrated function of the decision margin, because the pinned upstream classifier ships without probability estimates. Age is regressed in years, mapped to an adult bracket, and assigned probability mass using an uncertainty that combines the configured residual sigma, the disagreement across the sub-window ensemble, and an extrapolation term outside the range where the head has training support. Implausible estimates outside 18–120 abstain.
+
+Confidence is never scaled by audio quality; degraded audio raises the threshold a result must clear instead, so the emitted number stays interpretable. Scores below their threshold become `unknown` with confidence `0.0`; insufficient audio skips model inference entirely. Compressed audio is degraded only when probed source metadata is missing/narrowband or measured signal checks warrant it—not merely because FFmpeg decoded it. A segment whose sub-window embeddings disagree about the speaker is also treated as degraded.
 
 These scores are not proof, and they have not yet been calibrated on logistics calls. Treat `unknown` as a normal outcome. Before launch, evaluate calibration and subgroup error on consented, caller-only recordings from target carriers, languages, devices, and noise conditions.
 
@@ -197,23 +201,50 @@ Docker Compose provides safe CPU defaults. Important environment variables are:
 | `MODEL_BACKEND` | `ecapa` | Runnable `ecapa` baseline or an owned `wavlm_onnx` artifact. |
 | `WAVLM_MODEL_PATH` | `/opt/models/wavlm/model.onnx` | Graph containing WavLM, owned heads, and calibration. |
 | `MODEL_DEVICE` | `cpu` | Torch device, for example `cpu` or `cuda` in a GPU image. |
-| `TORCH_THREADS` | `2` | Intra-op Torch CPU threads. |
-| `INFERENCE_CONCURRENCY` | `1` | Concurrent inferences per process. The estimator itself is serialized. |
+| `TORCH_THREADS` | `2` | Intra-op Torch CPU threads. Measured sweet spot: inference plateaus at 2 threads (1.76×) and is slower at 8. |
+| `INFERENCE_CONCURRENCY` | `1` | Loaded model replicas. Measured: this absorbs bursts but does **not** raise throughput — per-container capacity is ~4 analyses/s either way, and more replicas raise p50 latency. Scale with containers. See [AUDIO_PIPELINE.md](backend/docs/AUDIO_PIPELINE.md#11-scaling-where-the-capacity-actually-goes). |
 | `QUEUE_TIMEOUT_SECONDS` | `1.0` | Wait before returning retriable `SERVICE_BUSY`. |
 | `INFERENCE_WINDOW_SECONDS` | `5.0` | Speech-evidence window selected from longer audio. |
 | `MAX_AUDIO_SECONDS` | `30` | Maximum decoded or streamed duration. |
 | `MAX_UPLOAD_BYTES` | `12582912` | Maximum audio payload bytes. |
 | `MIN_AUDIO_SECONDS` | `1.25` | Minimum decoded duration. |
 | `MIN_VOICED_SECONDS` | `0.65` | Minimum estimated voiced speech. |
-| `GENDER_CONFIDENCE_THRESHOLD` | `0.60` | Abstention threshold after quality adjustment. |
-| `AGE_CONFIDENCE_THRESHOLD` | `0.28` | Age-bracket abstention threshold. |
-| `DEGRADED_CONFIDENCE_FACTOR` | `0.75` | Confidence multiplier for degraded audio. |
-| `WS_EMIT_INTERVAL_SECONDS` | `1.0` | Minimum new-audio interval between progressive results. |
+| `AGC_ENABLED` | `true` | Normalize the inference window toward a target level. Applied after the quality gate, never before. |
+| `AGC_TARGET_DBFS`, `AGC_MAX_GAIN_DB` | `-20.0`, `20.0` | Normalization target and gain ceiling. Never clips. |
+| `AGC_MIN_LEVEL_DBFS` | `-45.0` | Below this the window is too quiet to be speech and is left alone rather than amplified. |
+| `DENOISE_BACKEND` | `none` | `spectral_gate` enables stationary-noise suppression. Off by default: it helps listeners and ASR but attenuates the detail paralinguistic models read. |
+| `WS_REORDER_WINDOW_FRAMES` | `8` | Frames held while awaiting a late one in `seq32` framing. |
+| `WS_MAX_LOSS_RATIO` | `0.15` | Concealed-frame ratio above which the analysis is reported `degraded`. |
+| `GENDER_CONFIDENCE_THRESHOLD` | `0.60` | Gender abstention threshold on good audio. Confidence is never rescaled by quality. |
+| `GENDER_CONFIDENCE_THRESHOLD_DEGRADED` | `0.75` | Stricter gender threshold on degraded audio. |
+| `AGE_CONFIDENCE_THRESHOLD` | `0.35` | Age-bracket abstention threshold on good audio. |
+| `AGE_CONFIDENCE_THRESHOLD_DEGRADED` | `0.45` | Stricter age threshold on degraded audio. |
+| `AGE_RESIDUAL_SIGMA_YEARS` | `10.0` | Assumed population residual of the age head. Must be measured on a domain holdout. |
+| `AGE_RELIABLE_MIN_YEARS`, `AGE_RELIABLE_MAX_YEARS` | `20.0`, `70.0` | Range where the age head has training support; estimates outside it get inflated uncertainty. |
+| `AGE_EXTRAPOLATION_SIGMA_PER_YEAR` | `0.15` | Relative uncertainty growth per year outside that range. |
+| `ENSEMBLE_WINDOWS` | `3` | Sub-windows encoded per request, giving per-sample age spread and a single-speaker check. |
+| `ENSEMBLE_MIN_WINDOW_SECONDS` | `2.0` | Shortest sub-window; below this the request falls back to one view. |
+| `MIN_SPEAKER_HOMOGENEITY` | `0.30` | Lowest pairwise sub-window cosine similarity accepted before an analysis is downgraded to `degraded`. |
+| `REQUIRE_CALIBRATED_GENDER` | `true` | Refuse to serve a gender head whose probabilities are an uncalibrated margin sigmoid. |
+| `EXPOSE_DEBUG_AGE_YEARS` | `false` | Evaluation only: return the regressor's raw age estimate so the harness can measure MAE and residual spread. Never persisted. |
+| `LANGUAGE_BACKEND` | `none` | `voxlingua_ecapa` adds a best-effort `language` field. Costs a second encoder pass (~165–205 ms); the field is absent when disabled. |
+| `LANGUAGE_CONFIDENCE_THRESHOLD` | `0.35` | Minimum top-1 posterior for a language answer. |
+| `LANGUAGE_MARGIN_RATIO` | `2.0` | How far the top language must lead the runner-up. Posteriors spread across 107 related languages, so a floor alone rejects correct answers. |
+| `LANGUAGE_REFRESH_SECONDS` | `3.0` | New streamed audio before the language is rechecked, so a caller switching language is followed. Lower detects switches sooner at one extra encoder pass each. |
+| `WS_EMIT_INTERVAL_SECONDS` | `1.0` | Minimum new-audio interval before the first progressive result. |
+| `WS_EMIT_BACKOFF` | `1.5` | Multiplier applied to that interval after each progressive result. |
+| `WS_MAX_EMIT_INTERVAL_SECONDS` | `8.0` | Ceiling for the backed-off interval. |
+| `WS_ANALYSIS_WINDOW_SECONDS` | `10.0` | Trailing audio a progressive update re-analyzes, so a long session costs a constant amount per update. |
 | `REQUEST_IDLE_TIMEOUT_SECONDS` | `10.0` | Maximum wait between HTTP request-body chunks. |
 | `WS_IDLE_TIMEOUT_SECONDS` | `30.0` | Maximum wait between WebSocket frames after start. |
 | `WS_MAX_SESSION_SECONDS` | `120.0` | Hard wall-clock limit for one WebSocket session. |
 | `WS_ALLOWED_ORIGINS` | local UI origins | Comma-separated browser origins allowed to open WebSockets; origin-less server adapters remain supported. |
 | `LOG_LEVEL` | `INFO` | JSON log level. |
+| `RATE_LIMIT_ENABLED` | `true` | In-process token bucket. Defence in depth only — the limit is **per container**, so N containers permit N times the rate. |
+| `RATE_LIMIT_REQUESTS_PER_MINUTE`, `RATE_LIMIT_BURST` | `60.0`, `10` | Sustained rate and burst per client. Over budget returns 429 with `Retry-After`, or WebSocket close 1013. |
+| `RATE_LIMIT_MAX_TRACKED_CLIENTS` | `10000` | Bound on the client table; an unbounded one is itself a DoS vector. |
+| `TRUSTED_PROXY_HOPS` | `0` | Proxies appending to `X-Forwarded-For`. `0` ignores the header. Too low collapses all callers into one bucket; too high lets a caller forge its identity. |
+| `HSTS_MAX_AGE_SECONDS` | `0` | Emit HSTS, but only on requests that actually arrived over HTTPS. `0` disables. |
 | `PERSISTENCE_ENABLED` | `false` in code; `true` in Compose | Deployment maximum; every request still defaults to `none`. |
 | `DATABASE_URL` | local Compose PostgreSQL | Result and audio-manifest metadata. |
 | `S3_ENDPOINT_URL`, `S3_BUCKET` | local Compose object store | S3-compatible retained-audio location. |
@@ -282,7 +313,7 @@ Before production, add TLS at the ingress, authentication, tenant authorization,
 - The default ECAPA/SVM/SVR model is a runnable baseline, not a logistics-domain production accuracy claim.
 - Age and perceived voice-presentation estimates can be wrong or abstain, especially for short, noisy, narrowband, accented, multilingual, or out-of-domain speech.
 - Mixed agent/caller audio is not diarized; integrations must send the caller channel only.
-- Language and accent detection are not implemented.
+- Language identification is optional, untested on telephony audio, and has no non-speech class: it will name a language for music or noise. Accent and dialect detection are not offered at all.
 - The local history API has no tenant authentication, and the bundled object store is for demonstration only.
 - The WavLM production path requires an owned, evaluated ONNX artifact; public backbone weights alone do not provide the required heads or calibration.
 
@@ -294,6 +325,8 @@ See the [model card](backend/docs/MODEL_CARD.md) and [privacy checklist](backend
 - [Model-selection decision record](backend/docs/ADR-001-model-selection.md)
 - [Production model rationale and ranked alternatives](backend/docs/ADR-002-production-model-strategy.md)
 - [Opt-in PostgreSQL/S3 persistence decision](backend/docs/ADR-003-opt-in-persistence.md)
+- [Language-identification decision and why accent is not offered](backend/docs/ADR-004-language-identification.md)
+- [Audio and inference pipeline: techniques, alternatives, measured trade-offs, and scaling costs](backend/docs/AUDIO_PIPELINE.md)
 - [200-word design write-up](backend/docs/DESIGN.md)
 - [Privacy and data lifecycle](backend/docs/PRIVACY.md)
 - [Browser and telephony streaming design](backend/docs/STREAMING.md)
