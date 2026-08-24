@@ -82,11 +82,14 @@ class AnalysisService:
         inference_window = None
         try:
             quality_source = SourceSpec(
-                encoding=source.encoding,
+                encoding=decoded.source_encoding,
                 sample_rate=decoded.source_sample_rate,
                 channels=source.channels,
                 content_type=source.content_type,
-                force_degraded=decoded.used_ffmpeg,
+                # FFmpeg is only the decoder. Using it says nothing about the
+                # signal quality. Remain conservative only when the container's
+                # source stream metadata could not be recovered.
+                force_degraded=not decoded.source_metadata_known,
             )
             quality = await _thread_call(
                 analyze_quality, samples, quality_source, self.settings

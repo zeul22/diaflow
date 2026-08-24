@@ -48,3 +48,12 @@ def test_websocket_origins_are_normalized_from_environment(monkeypatch) -> None:
         "https://voice.example",
         "http://localhost:3000",
     )
+
+
+def test_known_wavlm_backend_is_accepted() -> None:
+    replace(Settings(), model_backend="wavlm_onnx").validate()
+
+
+def test_unknown_model_backend_is_rejected() -> None:
+    with pytest.raises(ValueError, match="MODEL_BACKEND"):
+        replace(Settings(), model_backend="mystery").validate()

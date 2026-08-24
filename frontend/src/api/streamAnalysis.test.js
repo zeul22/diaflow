@@ -17,6 +17,20 @@ function prediction(sequence, isFinal) {
   };
 }
 
+function persistenceReceipt(overrides = {}) {
+  return {
+    mode: "result_and_audio",
+    status: "pending",
+    chunks_received: 0,
+    chunks_stored: 0,
+    segments_stored: 0,
+    bytes_stored: 0,
+    audio_expires_at: "2026-08-25T10:00:00Z",
+    result_expires_at: "2026-09-24T10:00:00Z",
+    ...overrides,
+  };
+}
+
 class FakeAudioNode {
   constructor() {
     this.connect = vi.fn(() => this);
@@ -163,6 +177,7 @@ describe("LiveAnalysisSession", () => {
       sample_rate: 16_000,
       channels: 1,
       contact_id: CONTACT_ID,
+      persistence_mode: "none",
     });
     expect(FakeAudioContext.instances[0].audioWorklet.addModule).toHaveBeenCalledWith(
       "/pcm-capture-worklet.js",
@@ -197,6 +212,77 @@ describe("LiveAnalysisSession", () => {
     expect(onPrediction).toHaveBeenLastCalledWith(prediction(2, true));
     expect(onState).toHaveBeenLastCalledWith("complete");
     expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("sends consent-gated audio retention fields in the start frame", async () => {
+    installLiveBrowser();
+    const { session, socket } = await startSession({
+      persistenceMode: "result_and_audio",
+      consentReference: "  approval-482  ",
+    });
+
+    expect(JSON.parse(socket.sent[0])).toMatchObject({
+      type: "start",
+      persistence_mode: "result_and_audio",
+      consent_reference: "approval-482",
+    });
+
+    await session.cancel();
+  });
+
+  it("consumes started and storage control events and merges progress into a prediction", async () => {
+    installLiveBrowser();
+    const onError = vi.fn();
+    const onPrediction = vi.fn();
+    const onStorage = vi.fn();
+    const { session, socket } = await startSession({
+      onError,
+      onPrediction,
+      onStorage,
+      persistenceMode: "result_and_audio",
+      consentReference: "approval-482",
+    });
+    const analysisId = "d18f3374-ee30-4cc9-863a-6574f0482e4d";
+    const started = persistenceReceipt();
+    const progress = persistenceReceipt({
+      chunks_received: 3,
+      chunks_stored: 2,
+      segments_stored: 1,
+      bytes_stored: 24_000,
+    });
+
+    socket.message({
+      type: "started",
+      contact_id: CONTACT_ID,
+      analysis_id: analysisId,
+      persistence: started,
+    });
+    socket.message({
+      type: "storage",
+      analysis_id: analysisId,
+      persistence: progress,
+    });
+    socket.message(prediction(1, false));
+
+    expect(onStorage).toHaveBeenNthCalledWith(1, {
+      type: "started",
+      contact_id: CONTACT_ID,
+      analysis_id: analysisId,
+      persistence: started,
+    });
+    expect(onStorage).toHaveBeenNthCalledWith(2, {
+      type: "storage",
+      analysis_id: analysisId,
+      persistence: progress,
+    });
+    expect(onPrediction).toHaveBeenCalledWith({
+      ...prediction(1, false),
+      analysis_id: analysisId,
+      persistence: progress,
+    });
+    expect(onError).not.toHaveBeenCalled();
+
+    await session.cancel();
   });
 
   it("fails closed on socket backpressure without sending or retaining the PCM chunk", async () => {

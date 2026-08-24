@@ -4,9 +4,13 @@ from uuid import uuid4
 
 import numpy as np
 import pytest
+from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from app.main import create_app
+from app.persistence import PersistenceService
 from tests.conftest import FakeEstimator, speechlike_pcm, wav_bytes
+from tests.test_persistence import FakeMetadataStore, FakeObjectStore, audio_settings
 
 
 def test_raw_wav_analysis_matches_contract(
@@ -207,3 +211,173 @@ def test_websocket_requires_explicit_sample_rate(client) -> None:
 
     assert response["type"] == "error"
     assert response["error"]["code"] == "WS_PROTOCOL_ERROR"
+
+
+def test_opted_in_rest_audio_is_manifested_and_deletable(
+    settings, fake_estimator: FakeEstimator
+) -> None:
+    metadata = FakeMetadataStore()
+    objects = FakeObjectStore()
+    storage = PersistenceService(
+        audio_settings(), metadata_store=metadata, object_store=objects
+    )
+    app = create_app(
+        settings=settings,
+        estimator=fake_estimator,
+        persistence=storage,
+    )
+    audio = wav_bytes(speechlike_pcm())
+
+    with TestClient(app) as persisted_client:
+        response = persisted_client.post(
+            "/analyze",
+            content=audio,
+            headers={
+                "Content-Type": "audio/wav",
+                "X-Persistence-Mode": "result_and_audio",
+                "X-Consent-Reference": "consent-record-42",
+            },
+        )
+
+        assert response.status_code == 200, response.text
+        result = response.json()
+        analysis_id = result["analysis_id"]
+        assert result["persistence"]["status"] == "stored"
+        assert result["persistence"]["chunks_stored"] == 1
+        assert result["persistence"]["segments_stored"] == 1
+        assert result["persistence"]["bytes_stored"] == len(audio)
+        assert list(objects.objects.values()) == [audio]
+        assert next(iter(metadata.sessions.values())).metadata == {
+            "consent_reference_sha256": (
+                "f14bcad92e2d14822a9399427db1fb0c8b41f3db899b6c12c9df46e97ff4ffae"
+            )
+        }
+
+        detail = persisted_client.get(f"/analyses/{analysis_id}")
+        assert detail.status_code == 200
+        assert detail.headers["cache-control"] == "no-store"
+        manifest = detail.json()
+        assert manifest["segment_count"] == 1
+        assert manifest["segments"][0]["logical_chunks"][0]["chunk_index"] == 0
+        assert manifest["segments"][0]["sha256"]
+
+        listing = persisted_client.get("/analyses")
+        assert listing.status_code == 200
+        assert listing.headers["cache-control"] == "no-store"
+        assert listing.json()["items"][0]["analysis_id"] == analysis_id
+
+        deleted = persisted_client.delete(f"/analyses/{analysis_id}")
+        assert deleted.status_code == 200
+        assert objects.objects == {}
+        assert metadata.sessions == {}
+
+
+def test_audio_retention_requires_consent_reference(
+    settings, fake_estimator: FakeEstimator
+) -> None:
+    storage = PersistenceService(
+        audio_settings(),
+        metadata_store=FakeMetadataStore(),
+        object_store=FakeObjectStore(),
+    )
+    app = create_app(
+        settings=settings,
+        estimator=fake_estimator,
+        persistence=storage,
+    )
+
+    with TestClient(app) as persisted_client:
+        response = persisted_client.post(
+            "/analyze",
+            content=wav_bytes(speechlike_pcm()),
+            headers={
+                "Content-Type": "audio/wav",
+                "X-Persistence-Mode": "result_and_audio",
+            },
+        )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "CONSENT_REFERENCE_REQUIRED"
+    assert fake_estimator.calls == 0
+
+
+def test_failed_retained_rest_request_deletes_partial_audio(settings) -> None:
+    class FailingEstimator(FakeEstimator):
+        def predict(self, samples: np.ndarray):
+            del samples
+            raise RuntimeError("model failed")
+
+    metadata = FakeMetadataStore()
+    objects = FakeObjectStore()
+    storage = PersistenceService(
+        audio_settings(), metadata_store=metadata, object_store=objects
+    )
+    app = create_app(
+        settings=settings,
+        estimator=FailingEstimator(),
+        persistence=storage,
+    )
+
+    with TestClient(app, raise_server_exceptions=False) as persisted_client:
+        response = persisted_client.post(
+            "/analyze",
+            content=wav_bytes(speechlike_pcm()),
+            headers={
+                "Content-Type": "audio/wav",
+                "X-Persistence-Mode": "result_and_audio",
+                "X-Consent-Reference": "consent-record-43",
+            },
+        )
+
+    assert response.status_code == 500
+    assert objects.objects == {}
+    assert metadata.sessions == {}
+
+
+def test_websocket_reports_physical_storage_progress(
+    settings, fake_estimator: FakeEstimator
+) -> None:
+    metadata = FakeMetadataStore()
+    objects = FakeObjectStore()
+    storage = PersistenceService(
+        audio_settings(), metadata_store=metadata, object_store=objects
+    )
+    app = create_app(
+        settings=settings,
+        estimator=fake_estimator,
+        persistence=storage,
+    )
+    raw_pcm = (speechlike_pcm(2.4) * 32767.0).astype("<i2").tobytes()
+
+    with TestClient(app) as persisted_client:
+        with persisted_client.websocket_connect("/ws/analyze") as websocket:
+            websocket.send_json(
+                {
+                    "type": "start",
+                    "encoding": "pcm_s16le",
+                    "sample_rate": 16_000,
+                    "channels": 1,
+                    "persistence_mode": "result_and_audio",
+                    "consent_reference": "ws-consent-7",
+                }
+            )
+            started = websocket.receive_json()
+            assert started["type"] == "started"
+            websocket.send_bytes(raw_pcm)
+            progress = websocket.receive_json()
+            assert progress["type"] == "storage"
+            assert progress["persistence"]["chunks_received"] == 1
+            assert progress["persistence"]["chunks_stored"] == 0
+            assert progress["persistence"]["segments_stored"] == 2
+            provisional = websocket.receive_json()
+            assert provisional["type"] == "prediction"
+            websocket.send_json({"type": "end"})
+            final = websocket.receive_json()
+
+        assert final["is_final"] is True
+        assert final["persistence"]["status"] == "stored"
+        assert final["persistence"]["chunks_stored"] == 1
+        assert final["persistence"]["segments_stored"] == 3
+        detail = persisted_client.get(f"/analyses/{final['analysis_id']}").json()
+        assert detail["audio_bytes"] == len(raw_pcm)
+        assert b"".join(objects.objects.values()) == raw_pcm

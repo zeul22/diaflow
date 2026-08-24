@@ -1,3 +1,5 @@
+import { PERSISTENCE_MODES, persistenceHeaders } from "./persistence.js";
+
 export const MAX_AUDIO_BYTES = 12 * 1024 * 1024;
 
 const AUDIO_EXTENSIONS = new Set([
@@ -86,7 +88,13 @@ export function isAnalysisResponse(value) {
   );
 }
 
-export async function analyzeAudio({ file, contactId = "", signal }) {
+export async function analyzeAudio({
+  file,
+  contactId = "",
+  persistenceMode = PERSISTENCE_MODES.NONE,
+  consentReference = "",
+  signal,
+}) {
   const form = new FormData();
   form.append("audio", file, file.name || "recording");
   if (contactId.trim()) form.append("contact_id", contactId.trim());
@@ -97,7 +105,10 @@ export async function analyzeAudio({ file, contactId = "", signal }) {
       method: "POST",
       body: form,
       signal,
-      headers: { Accept: "application/json" },
+      headers: {
+        Accept: "application/json",
+        ...persistenceHeaders({ mode: persistenceMode, consentReference }),
+      },
     });
   } catch (error) {
     if (error?.name === "AbortError") throw error;

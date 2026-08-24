@@ -84,6 +84,32 @@ def _valid_probability(value: float) -> float:
     return numeric
 
 
+def _direct_age_prediction(
+    probabilities: dict[str, float] | object,
+    *,
+    factor: float,
+    threshold: float,
+) -> AgeBracketPrediction:
+    if not hasattr(probabilities, "get"):
+        return AgeBracketPrediction(prediction="unknown", confidence=0.0)
+    normalized: dict[str, float] = {
+        label: _valid_probability(probabilities.get(label, 0.0))
+        for label, _, _ in AGE_RANGES
+    }
+    total = sum(normalized.values())
+    if total <= 0.0:
+        return AgeBracketPrediction(prediction="unknown", confidence=0.0)
+    normalized = {label: value / total for label, value in normalized.items()}
+    label = max(normalized, key=normalized.get)
+    confidence = normalized[label] * factor
+    if confidence < threshold:
+        return AgeBracketPrediction(prediction="unknown", confidence=0.0)
+    return AgeBracketPrediction(
+        prediction=label,
+        confidence=round(min(1.0, confidence), 4),
+    )
+
+
 def unknown_response(
     contact_id: UUID,
     processing_ms: int,
@@ -125,24 +151,33 @@ def build_response(
             confidence=round(min(1.0, gender_confidence), 4),
         )
 
-    age_label = (
-        age_to_bracket(float(raw.age_years)) if raw.age_years is not None else "unknown"
-    )
-    age_confidence = 0.0
-    if age_label != "unknown" and raw.age_years is not None:
-        age_confidence = (
-            _age_bracket_confidence(
-                float(raw.age_years), age_label, settings.age_residual_sigma_years
-            )
-            * factor
+    if raw.age_bracket_probabilities is not None:
+        age = _direct_age_prediction(
+            raw.age_bracket_probabilities,
+            factor=factor,
+            threshold=settings.age_confidence_threshold,
         )
-    if age_label == "unknown" or age_confidence < settings.age_confidence_threshold:
-        age = AgeBracketPrediction(prediction="unknown", confidence=0.0)
     else:
-        age = AgeBracketPrediction(
-            prediction=age_label,
-            confidence=round(min(1.0, age_confidence), 4),
+        age_label = (
+            age_to_bracket(float(raw.age_years))
+            if raw.age_years is not None
+            else "unknown"
         )
+        age_confidence = 0.0
+        if age_label != "unknown" and raw.age_years is not None:
+            age_confidence = (
+                _age_bracket_confidence(
+                    float(raw.age_years), age_label, settings.age_residual_sigma_years
+                )
+                * factor
+            )
+        if age_label == "unknown" or age_confidence < settings.age_confidence_threshold:
+            age = AgeBracketPrediction(prediction="unknown", confidence=0.0)
+        else:
+            age = AgeBracketPrediction(
+                prediction=age_label,
+                confidence=round(min(1.0, age_confidence), 4),
+            )
 
     return AnalysisResponse(
         contact_id=contact_id,

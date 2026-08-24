@@ -21,6 +21,7 @@ FROM python:3.11-slim-bookworm AS runtime
 ENV DEBIAN_FRONTEND=noninteractive \
     HF_HUB_OFFLINE=1 \
     HF_HUB_DISABLE_TELEMETRY=1 \
+    ORT_DISABLE_TELEMETRY=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_CACHE_DIR=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -41,15 +42,19 @@ RUN apt-get update \
 WORKDIR /srv/app
 
 COPY pyproject.toml README.md ./
+
+# Pin CPU wheels so x86 images do not pull CUDA libraries. The extra remains
+# architecture-portable on Docker's supported Linux targets. Installing the
+# dependency metadata before application sources keeps this expensive layer
+# cached during ordinary source edits.
+RUN pip install --index-url https://download.pytorch.org/whl/cpu \
+      "torch==2.8.0" "torchaudio==2.8.0" \
+    && pip install ".[model,wavlm]"
+
 COPY LICENSE /licenses/service-MIT.txt
 COPY THIRD_PARTY_NOTICES.md /licenses/THIRD_PARTY_NOTICES.md
 COPY app ./app
-
-# Pin CPU wheels so x86 images do not pull CUDA libraries. The extra remains
-# architecture-portable on Docker's supported Linux targets.
-RUN pip install --index-url https://download.pytorch.org/whl/cpu \
-      "torch==2.8.0" "torchaudio==2.8.0" \
-    && pip install ".[model]"
+RUN pip install --force-reinstall --no-deps .
 
 COPY --from=model-builder /opt/models /opt/models
 

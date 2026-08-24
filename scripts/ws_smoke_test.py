@@ -38,25 +38,44 @@ def synthetic_pcm(
     return bytes(frames)
 
 
-async def run(url: str, encoding: str) -> None:
+async def _next_prediction(socket, controls: list[dict]) -> dict:
+    while True:
+        payload = json.loads(await asyncio.wait_for(socket.recv(), timeout=10))
+        if payload.get("type") == "prediction":
+            return payload
+        if payload.get("type") == "error":
+            raise SystemExit(f"WebSocket service error: {payload}")
+        if payload.get("type") in {"started", "storage", "pong"}:
+            controls.append(payload)
+            continue
+        raise SystemExit(f"unexpected WebSocket message: {payload}")
+
+
+async def run(
+    url: str,
+    encoding: str,
+    persistence_mode: str,
+    consent_reference: str,
+) -> None:
     audio = synthetic_pcm(encoding=encoding)
     one_second = 16_000 * (4 if encoding == "pcm_f32le" else 2)
+    controls: list[dict] = []
     async with websockets.connect(url, ping_interval=None) as socket:
-        await socket.send(
-            json.dumps(
-                {
-                    "type": "start",
-                    "encoding": encoding,
-                    "sample_rate": 16_000,
-                    "channels": 1,
-                }
-            )
-        )
+        start = {
+            "type": "start",
+            "encoding": encoding,
+            "sample_rate": 16_000,
+            "channels": 1,
+            "persistence_mode": persistence_mode,
+        }
+        if persistence_mode == "result_and_audio":
+            start["consent_reference"] = consent_reference
+        await socket.send(json.dumps(start))
         await socket.send(audio[:one_second])
         await socket.send(audio[one_second:])
-        progressive = json.loads(await asyncio.wait_for(socket.recv(), timeout=10))
+        progressive = await _next_prediction(socket, controls)
         await socket.send(json.dumps({"type": "end"}))
-        final = json.loads(await asyncio.wait_for(socket.recv(), timeout=10))
+        final = await _next_prediction(socket, controls)
 
     if progressive.get("type") != "prediction" or progressive.get("is_final"):
         raise SystemExit("missing progressive prediction")
@@ -64,7 +83,21 @@ async def run(url: str, encoding: str) -> None:
         raise SystemExit("missing final prediction")
     if final.get("sequence") != progressive.get("sequence", 0) + 1:
         raise SystemExit("prediction sequence is not monotonic")
-    print(json.dumps({"progressive": progressive, "final": final}, indent=2))
+    if persistence_mode != "none":
+        if not any(item.get("type") == "started" for item in controls):
+            raise SystemExit("retained stream did not receive a started receipt")
+        if final.get("persistence", {}).get("status") != "stored":
+            raise SystemExit("retained stream did not receive a final stored receipt")
+    if persistence_mode == "result_and_audio" and not any(
+        item.get("type") == "storage" for item in controls
+    ):
+        raise SystemExit("retained audio stream did not receive storage progress")
+    print(
+        json.dumps(
+            {"storage_messages": controls, "progressive": progressive, "final": final},
+            indent=2,
+        )
+    )
 
 
 def main() -> None:
@@ -75,8 +108,21 @@ def main() -> None:
         choices=("pcm_s16le", "pcm_f32le"),
         default="pcm_s16le",
     )
+    parser.add_argument(
+        "--persistence-mode",
+        choices=("none", "result", "result_and_audio"),
+        default="none",
+    )
+    parser.add_argument("--consent-reference", default="synthetic-ws-smoke-test")
     args = parser.parse_args()
-    asyncio.run(run(args.url, args.encoding))
+    asyncio.run(
+        run(
+            args.url,
+            args.encoding,
+            args.persistence_mode,
+            args.consent_reference,
+        )
+    )
 
 
 if __name__ == "__main__":

@@ -1,15 +1,21 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
+from types import SimpleNamespace
+from uuid import uuid4
 
 import numpy as np
 import pytest
 
-from app.audio.decoder import AudioDecoder
-from app.audio.quality import analyze_quality
+from app.audio.decoder import AudioDecoder, DecodedAudio
+from app.audio.quality import analyze_quality, prepare_inference_window
 from app.audio.types import SourceSpec
+from app.inference.postprocess import QualitySummary
+from app.inference.service import AnalysisService
+from app.observability.metrics import Metrics
 from app.schemas import AudioQuality
-from tests.conftest import speechlike_pcm, wav_bytes
+from tests.conftest import FakeEstimator, speechlike_pcm, wav_bytes
 
 
 def test_native_wav_decoder_resamples(settings) -> None:
@@ -72,3 +78,101 @@ def test_wav_duration_is_bounded_before_resampling(settings, monkeypatch) -> Non
         decoder.decode(payload, SourceSpec(encoding="wav"))
 
     assert getattr(caught.value, "code", None) == "INVALID_AUDIO"
+
+
+def test_ffmpeg_decode_carries_input_codec_and_sample_rate(
+    settings, monkeypatch
+) -> None:
+    samples = speechlike_pcm(duration=1.5)
+
+    def fake_run(command, **kwargs):
+        assert command[command.index("-loglevel") + 1] == "info"
+        assert kwargs["timeout"] == settings.decode_timeout_seconds
+        return SimpleNamespace(
+            returncode=0,
+            stdout=samples.astype("<f4").tobytes(),
+            stderr=(
+                b"Input #0, mov,mp4,m4a, from 'pipe:0':\n"
+                b"  Stream #0:0: Audio: aac (LC), 48000 Hz, mono, fltp\n"
+                b"Output #0, f32le, to 'pipe:1':\n"
+                b"  Stream #0:0: Audio: pcm_f32le, 16000 Hz, mono, flt\n"
+            ),
+        )
+
+    monkeypatch.setattr("app.audio.decoder.subprocess.run", fake_run)
+    decoded = AudioDecoder(settings).decode(b"mock-m4a", SourceSpec(encoding="auto"))
+
+    assert decoded.used_ffmpeg is True
+    assert decoded.source_encoding == "aac"
+    assert decoded.source_sample_rate == 48_000
+    assert decoded.source_metadata_known is True
+
+
+@pytest.mark.parametrize(
+    ("metadata_known", "expected_quality"),
+    [
+        (True, AudioQuality.GOOD),
+        (False, AudioQuality.DEGRADED),
+    ],
+)
+def test_service_does_not_treat_ffmpeg_as_a_quality_failure(
+    settings, monkeypatch, metadata_known, expected_quality
+) -> None:
+    service = AnalysisService(
+        settings=settings,
+        estimator=FakeEstimator(),
+        metrics=Metrics(),
+    )
+    decoded = DecodedAudio(
+        samples=speechlike_pcm(),
+        sample_rate=16_000,
+        source_sample_rate=48_000 if metadata_known else 16_000,
+        source_encoding="aac" if metadata_known else "auto",
+        source_metadata_known=metadata_known,
+        used_ffmpeg=True,
+    )
+    monkeypatch.setattr(service.decoder, "decode", lambda *_args: decoded)
+
+    def fake_quality(_samples, source, _settings):
+        label = (
+            AudioQuality.DEGRADED if source.is_quality_limited else AudioQuality.GOOD
+        )
+        return QualitySummary(
+            label=label,
+            duration_seconds=3.0,
+            voiced_seconds=2.5,
+            speech_ratio=0.8,
+            snr_db=20.0,
+            clipping_ratio=0.0,
+            rms_dbfs=-20.0,
+            spectral_flatness=0.1,
+            low_frequency_ratio=0.2,
+        )
+
+    monkeypatch.setattr("app.inference.service.analyze_quality", fake_quality)
+    response = asyncio.run(
+        service.analyze(
+            payload=b"mock-m4a",
+            source=SourceSpec(encoding="auto", content_type="audio/mp4"),
+            contact_id=uuid4(),
+        )
+    )
+
+    assert response.audio_quality is expected_quality
+
+
+def test_inference_window_prefers_speech_over_louder_stationary_noise(settings) -> None:
+    rng = np.random.default_rng(42)
+    stationary_noise = rng.normal(0.0, 0.42, 5 * 16_000).astype(np.float32)
+    speech = (0.55 * speechlike_pcm(duration=5.0)).astype(np.float32)
+    recording = np.concatenate((stationary_noise, speech))
+
+    selected = prepare_inference_window(recording, settings)
+    selected_quality = analyze_quality(
+        selected,
+        SourceSpec(encoding="pcm_f32le", sample_rate=16_000),
+        settings,
+    )
+
+    assert selected.size == 5 * 16_000
+    assert selected_quality.spectral_flatness < 0.30

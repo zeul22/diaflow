@@ -1,4 +1,4 @@
-# Model card: SpeechBrain ECAPA with griko attribute heads
+# Model card: Runnable ECAPA baseline
 
 ## Summary
 
@@ -8,6 +8,8 @@ This service uses one pretrained SpeechBrain ECAPA-TDNN speaker encoder and two 
 - an SVR that estimates age in years, which service postprocessing converts to `18-30`, `31-45`, `46-60`, or `60+`.
 
 The API can return `unknown` for either attribute and separately labels audio `good`, `degraded`, or `insufficient`. The service name `gender` follows the required contract; the model estimates perceived binary voice presentation, not gender identity or biological sex.
+
+This is the Compose-default baseline and rollback path, not the final production-accuracy claim. [ADR-002](ADR-002-production-model-strategy.md) selects logistics-trained WavLM Base+ joint heads as the target after paired evaluation.
 
 ## Artifact identity
 
@@ -34,11 +36,11 @@ Exact file SHA-256 values are maintained in `scripts/prepare_models.py` and copi
 - Authentication, authorization, surveillance, biometrics, fraud adjudication, or law enforcement.
 - Eligibility, pricing, credit, insurance, employment, medical, legal, safety, or other consequential decisions.
 - Mixed agent/caller audio, multi-party calls, hold music, or recordings without required notice/consent.
-- Silent profile enrichment or durable demographic databases.
+- Silent, unconsented, or indefinite profile enrichment and demographic databases.
 
 ## Input and preprocessing
 
-The estimator consumes finite, mono, 16 kHz float32 PCM. The service accepts native WAV and raw PCM/G.711, while bundled FFmpeg handles common compressed containers. Stereo is averaged, and non-16 kHz input is linearly resampled. Samples are centered, clipped to `[-1,1]`, and capped at 30 seconds. For longer inputs, the highest-energy contiguous five-second window is selected.
+The estimator consumes finite, mono, 16 kHz float32 PCM. The service accepts native WAV and raw PCM/G.711, while bundled FFmpeg handles common compressed containers and probes their original codec/rate. Stereo is averaged, and non-16 kHz input is linearly resampled. Samples are centered, clipped to `[-1,1]`, and capped at 30 seconds. For longer inputs, a speech-evidence score selects a contiguous five-second window, with a conservative energy fallback.
 
 No speech enhancement, denoising, diarization, source separation, echo cancellation, transcription, language identification, or spoof detection is performed. Telephony integration must send only the caller/contact channel.
 
@@ -48,7 +50,7 @@ The gate estimates duration, RMS level, voiced-frame coverage, SNR, clipping, sp
 
 Default insufficient triggers include duration below 1.25 seconds, estimated voiced speech below 0.65 seconds, speech ratio below 0.08, or RMS below -48 dBFS. Default degraded triggers include duration below two seconds, speech ratio below 0.22, SNR below 8 dB, clipping above 2%, low-frequency energy ratio above 0.55, or narrowband source. These are signal heuristics and may misclassify music, synthetic speech, unusual voices, or stationary noise.
 
-Insufficient audio returns both outputs as unknown with zero confidence and skips the model. Degraded audio continues but multiplies confidence by `0.75`. FFmpeg-fallback input is conservatively degraded when its original bandwidth is not natively known.
+Insufficient audio returns both outputs as unknown with zero confidence and skips the model. Degraded audio continues but multiplies confidence by `0.75`. FFmpeg use is not itself a degradation trigger; missing probed metadata and known narrowband codecs remain conservative triggers.
 
 ## Outputs and confidence
 

@@ -9,7 +9,8 @@ __pycache__/
 .coverage
 coverage.xml
 htmlcov/
-models/
+/build/
+/models/
 frontend/node_modules/
 frontend/dist/
 

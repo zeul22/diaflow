@@ -1,4 +1,38 @@
 services:
+  postgres:
+    image: postgres:17.11-alpine3.23
+    environment:
+      POSTGRES_DB: voice_attributes
+      POSTGRES_USER: voice_attributes
+      POSTGRES_PASSWORD: local-only
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U voice_attributes -d voice_attributes"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    stop_grace_period: 10s
+
+  # Local S3-compatible showcase only. Production should use managed S3 (or an
+  # actively maintained equivalent) with KMS, private networking, and IAM.
+  object-storage:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: voice-local
+      MINIO_ROOT_PASSWORD: voice-local-development-only
+    volumes:
+      - object-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    ports:
+      - "127.0.0.1:9001:9001"
+    stop_grace_period: 10s
+
   voice-attributes:
     build:
       context: .
@@ -6,6 +40,11 @@ services:
       target: runtime
     image: voice-contact-attributes:local
     init: true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      object-storage:
+        condition: service_healthy
     ports:
       - "127.0.0.1:8000:8000"
     environment:
@@ -17,6 +56,18 @@ services:
       REQUEST_IDLE_TIMEOUT_SECONDS: "10"
       WS_IDLE_TIMEOUT_SECONDS: "30"
       WS_MAX_SESSION_SECONDS: "120"
+      PERSISTENCE_ENABLED: "true"
+      DATABASE_URL: postgresql://voice_attributes:local-only@postgres:5432/voice_attributes
+      S3_ENDPOINT_URL: http://object-storage:9000
+      S3_REGION: us-east-1
+      S3_BUCKET: voice-audio
+      S3_ACCESS_KEY: voice-local
+      S3_SECRET_KEY: voice-local-development-only
+      AUDIO_RETENTION_HOURS: "24"
+      RESULT_RETENTION_DAYS: "30"
+      STORAGE_SEGMENT_SECONDS: "1.0"
+      STORAGE_OPERATION_TIMEOUT_SECONDS: "5.0"
+      STORAGE_WORKER_THREADS: "4"
     read_only: true
     tmpfs:
       - /tmp:size=384m,mode=1777
@@ -46,3 +97,7 @@ services:
     security_opt:
       - no-new-privileges:true
     stop_grace_period: 5s
+
+volumes:
+  postgres-data:
+  object-data:

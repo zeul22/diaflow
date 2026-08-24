@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import re
 import subprocess
 import wave
 from dataclasses import dataclass
@@ -18,6 +19,8 @@ class DecodedAudio:
     samples: npt.NDArray[np.float32]
     sample_rate: int
     source_sample_rate: int
+    source_encoding: str
+    source_metadata_known: bool
     used_ffmpeg: bool
 
     @property
@@ -35,13 +38,29 @@ class AudioDecoder:
 
         encoding = source.encoding
         source_sample_rate = source.sample_rate
+        source_encoding = encoding
+        source_metadata_known = encoding != "auto"
         used_ffmpeg = False
         if encoding == "wav" or self._looks_like_wav(payload):
             try:
                 samples, sample_rate = self._decode_wav(payload)
                 source_sample_rate = sample_rate
+                source_encoding = "wav"
+                source_metadata_known = True
             except (EOFError, ValueError, wave.Error):
-                samples, sample_rate = self._decode_with_ffmpeg(payload)
+                (
+                    samples,
+                    sample_rate,
+                    probed_encoding,
+                    probed_sample_rate,
+                ) = self._decode_with_ffmpeg(payload)
+                if probed_encoding is not None:
+                    source_encoding = probed_encoding
+                if probed_sample_rate is not None:
+                    source_sample_rate = probed_sample_rate
+                source_metadata_known = (
+                    probed_encoding is not None and probed_sample_rate is not None
+                )
                 used_ffmpeg = True
         elif encoding in {"pcm_s16le", "pcm_s16be", "pcm_f32le"}:
             samples, sample_rate = self._decode_pcm(payload, source)
@@ -52,7 +71,19 @@ class AudioDecoder:
             samples = self._mix_channels(self._decode_alaw(payload), source.channels)
             sample_rate = source.sample_rate
         else:
-            samples, sample_rate = self._decode_with_ffmpeg(payload)
+            (
+                samples,
+                sample_rate,
+                probed_encoding,
+                probed_sample_rate,
+            ) = self._decode_with_ffmpeg(payload)
+            if probed_encoding is not None:
+                source_encoding = probed_encoding
+            if probed_sample_rate is not None:
+                source_sample_rate = probed_sample_rate
+            source_metadata_known = (
+                probed_encoding is not None and probed_sample_rate is not None
+            )
             used_ffmpeg = True
 
         if not 8_000 <= sample_rate <= 96_000:
@@ -86,6 +117,8 @@ class AudioDecoder:
             samples=samples,
             sample_rate=sample_rate,
             source_sample_rate=source_sample_rate,
+            source_encoding=source_encoding,
+            source_metadata_known=source_metadata_known,
             used_ffmpeg=used_ffmpeg,
         )
 
@@ -198,13 +231,13 @@ class AudioDecoder:
 
     def _decode_with_ffmpeg(
         self, payload: bytes | bytearray
-    ) -> tuple[npt.NDArray[np.float32], int]:
+    ) -> tuple[npt.NDArray[np.float32], int, str | None, int | None]:
         duration_limit = self.settings.max_audio_seconds + 0.1
         command = [
             self.settings.ffmpeg_binary,
             "-hide_banner",
             "-loglevel",
-            "error",
+            "info",
             "-nostdin",
             "-threads",
             "1",
@@ -248,7 +281,33 @@ class AudioDecoder:
         )
         if len(completed.stdout) > maximum_output:
             raise InvalidAudioError("Decoded audio exceeds the duration limit")
+        source_encoding, source_sample_rate = self._parse_ffmpeg_audio_info(
+            completed.stderr
+        )
         return (
             np.frombuffer(completed.stdout, dtype="<f4").astype(np.float32),
             self.settings.target_sample_rate,
+            source_encoding,
+            source_sample_rate,
         )
+
+    @staticmethod
+    def _parse_ffmpeg_audio_info(stderr: bytes) -> tuple[str | None, int | None]:
+        """Read source stream facts from FFmpeg's bounded decode diagnostics.
+
+        FFmpeg prints the input stream before the generated PCM output stream, so
+        selecting the first match avoids mistaking the forced 16 kHz output for
+        the source. No second probe process or persistence of the input is needed.
+        """
+
+        diagnostics = stderr.decode("utf-8", errors="replace")
+        match = re.search(
+            r"Audio:\s*([A-Za-z0-9_]+)[^\r\n]*?,\s*(\d{4,6})\s+Hz\b",
+            diagnostics,
+        )
+        if match is None:
+            return None, None
+        sample_rate = int(match.group(2))
+        if not 8_000 <= sample_rate <= 96_000:
+            return None, None
+        return match.group(1).lower(), sample_rate

@@ -126,7 +126,46 @@ def prepare_inference_window(
     blocks = usable.reshape(-1, block_size)
     block_energy = np.mean(blocks * blocks, axis=1)
     block_count = max(1, int(settings.inference_window_seconds * 10))
-    rolling = np.convolve(block_energy, np.ones(block_count), mode="valid")
+
+    # Rank windows by speech-like evidence instead of raw loudness. Logistics
+    # recordings commonly contain stationary engine or road noise that can be
+    # louder than the caller; an energy-only selector systematically chose it.
+    block_rms = np.sqrt(block_energy + 1e-12)
+    block_db = 20.0 * np.log10(np.maximum(block_rms, 1e-8))
+    zero_crossing = np.mean(
+        np.signbit(blocks[:, 1:]) != np.signbit(blocks[:, :-1]), axis=1
+    )
+    window = np.hanning(block_size)
+    power = np.abs(np.fft.rfft(blocks * window, axis=1)) ** 2
+    arithmetic = np.mean(power + 1e-12, axis=1)
+    geometric = np.exp(np.mean(np.log(power + 1e-12), axis=1))
+    flatness = geometric / arithmetic
+
+    activity_floor = max(-50.0, float(np.percentile(block_db, 20)) + 3.0)
+    active = block_db > activity_floor
+    plausible_crossing = (zero_crossing > 0.003) & (zero_crossing < 0.35)
+    tonal_voice_shape = np.clip((0.55 - flatness) / 0.45, 0.0, 1.0)
+
+    # Natural speech changes in level and spectral shape. Give that movement a
+    # bounded bonus so a loud, steady tone cannot dominate solely through RMS.
+    level_change = np.zeros_like(block_db)
+    level_change[1:] = np.abs(np.diff(block_db))
+    normalized_power = power / np.maximum(np.sum(power, axis=1, keepdims=True), 1e-12)
+    spectral_change = np.zeros_like(block_db)
+    spectral_change[1:] = 0.5 * np.sum(
+        np.abs(np.diff(normalized_power, axis=0)), axis=1
+    )
+    movement = np.clip(level_change / 6.0 + spectral_change / 0.20, 0.0, 1.0)
+    speech_evidence = (
+        active.astype(np.float32)
+        * plausible_crossing.astype(np.float32)
+        * tonal_voice_shape.astype(np.float32)
+        * (0.65 + 0.35 * movement.astype(np.float32))
+    )
+    rolling = np.convolve(speech_evidence, np.ones(block_count), mode="valid")
+    if float(np.max(rolling)) <= 1e-6:
+        # Conservative fallback for unusual but usable speech spectra.
+        rolling = np.convolve(block_energy, np.ones(block_count), mode="valid")
     best_block = int(np.argmax(rolling))
     start = best_block * block_size
     selected = centered[start : start + window_samples]

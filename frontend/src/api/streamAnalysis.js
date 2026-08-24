@@ -1,5 +1,9 @@
 import { isAnalysisResponse } from "./analyze.js";
 import {
+  PERSISTENCE_MODES,
+  persistenceStartFields,
+} from "./persistence.js";
+import {
   MAX_CAPTURE_SECONDS,
   MicrophoneCaptureError,
   microphoneError,
@@ -10,6 +14,14 @@ const CHUNK_SECONDS = 0.25;
 const MAX_SOCKET_BUFFER_BYTES = 512 * 1024;
 const SOCKET_OPEN_TIMEOUT_MS = 5000;
 const LEVEL_UPDATE_INTERVAL_MS = 100;
+const PERSISTENCE_STATUSES = new Set([
+  "pending",
+  "stored",
+  "partial",
+  "deletion_pending",
+  "deleted",
+  "failed",
+]);
 
 const STREAM_ERROR_COPY = {
   AUDIO_TOO_LONG: "The live sample reached the service duration limit.",
@@ -43,8 +55,60 @@ function isPredictionMessage(payload) {
       Number.isInteger(payload.sequence) &&
       payload.sequence > 0 &&
       typeof payload.is_final === "boolean" &&
+      (payload.analysis_id === undefined ||
+        (typeof payload.analysis_id === "string" && payload.analysis_id.length <= 128)) &&
+      (payload.persistence === undefined ||
+        payload.persistence === null ||
+        isPersistenceReceipt(payload.persistence)) &&
       isAnalysisResponse(payload),
   );
+}
+
+function isNonnegativeInteger(value) {
+  return Number.isInteger(value) && value >= 0;
+}
+
+function isOptionalTimestamp(value) {
+  return value === undefined || value === null || (typeof value === "string" && value.length <= 64);
+}
+
+function isPersistenceReceipt(value) {
+  return Boolean(
+    value &&
+      typeof value === "object" &&
+      Object.values(PERSISTENCE_MODES).includes(value.mode) &&
+      PERSISTENCE_STATUSES.has(value.status) &&
+      isNonnegativeInteger(value.chunks_received) &&
+      isNonnegativeInteger(value.chunks_stored) &&
+      isNonnegativeInteger(value.segments_stored) &&
+      isNonnegativeInteger(value.bytes_stored) &&
+      isOptionalTimestamp(value.audio_expires_at) &&
+      isOptionalTimestamp(value.result_expires_at),
+  );
+}
+
+function parseStorageMessage(payload) {
+  if (!["started", "storage"].includes(payload?.type)) return null;
+  if (
+    typeof payload.analysis_id !== "string" ||
+    payload.analysis_id.length < 1 ||
+    payload.analysis_id.length > 128 ||
+    !isPersistenceReceipt(payload.persistence)
+  ) {
+    return null;
+  }
+  if (
+    payload.contact_id !== undefined &&
+    (typeof payload.contact_id !== "string" || payload.contact_id.length > 128)
+  ) {
+    return null;
+  }
+  return {
+    type: payload.type,
+    analysis_id: payload.analysis_id,
+    ...(payload.contact_id ? { contact_id: payload.contact_id } : {}),
+    persistence: payload.persistence,
+  };
 }
 
 function parseServiceError(payload) {
@@ -223,12 +287,24 @@ class PcmMicrophoneCapture {
 }
 
 export class LiveAnalysisSession {
-  constructor({ onError, onPrediction, onState, onStats, webSocketFactory } = {}) {
+  constructor({
+    consentReference = "",
+    onError,
+    onPrediction,
+    onState,
+    onStats,
+    onStorage,
+    persistenceMode = PERSISTENCE_MODES.NONE,
+    webSocketFactory,
+  } = {}) {
     this.onError = onError || (() => {});
     this.onPrediction = onPrediction || (() => {});
     this.onState = onState || (() => {});
     this.onStats = onStats || (() => {});
+    this.onStorage = onStorage || (() => {});
     this.webSocketFactory = webSocketFactory || ((url) => new WebSocket(url));
+    this.persistenceMode = persistenceMode;
+    this.consentReference = consentReference;
     this.capture = null;
     this.socket = null;
     this.sampleRate = 0;
@@ -238,6 +314,7 @@ export class LiveAnalysisSession {
     this.chunksSent = 0;
     this.bytesSent = 0;
     this.lastSequence = 0;
+    this.latestStorage = null;
     this.phase = "idle";
     this.cancelled = false;
     this.failed = false;
@@ -272,6 +349,10 @@ export class LiveAnalysisSession {
         encoding: "pcm_f32le",
         sample_rate: this.sampleRate,
         channels: 1,
+        ...persistenceStartFields({
+          mode: this.persistenceMode,
+          consentReference: this.consentReference,
+        }),
       };
       if (contactId.trim()) start.contact_id = contactId.trim();
       try {
@@ -386,6 +467,20 @@ export class LiveAnalysisSession {
       return;
     }
     if (payload?.type === "pong") return;
+    if (["started", "storage"].includes(payload?.type)) {
+      const storage = parseStorageMessage(payload);
+      if (!storage) {
+        void this.fail(
+          new StreamAnalysisError("The service sent invalid storage progress.", {
+            code: "INVALID_STREAM_RESPONSE",
+          }),
+        );
+        return;
+      }
+      this.latestStorage = storage;
+      this.onStorage(storage);
+      return;
+    }
     if (payload?.type === "error") {
       const serviceError = parseServiceError(payload);
       if (!serviceError) {
@@ -415,12 +510,28 @@ export class LiveAnalysisSession {
       return;
     }
     if (payload.sequence <= this.lastSequence) return;
+    const prediction = payload.persistence
+      ? payload
+      : this.latestStorage
+        ? {
+            ...payload,
+            analysis_id: payload.analysis_id || this.latestStorage.analysis_id,
+            persistence: this.latestStorage.persistence,
+          }
+        : payload;
+    if (payload.persistence) {
+      this.latestStorage = {
+        type: "storage",
+        analysis_id: payload.analysis_id || this.latestStorage?.analysis_id || "",
+        persistence: payload.persistence,
+      };
+    }
     if (payload.is_final) {
       this.finalReceived = true;
       this.phase = "complete";
     }
     this.lastSequence = payload.sequence;
-    this.onPrediction(payload);
+    this.onPrediction(prediction);
     if (payload.is_final) {
       wipeChunks(this.pending);
       this.pendingSamples = 0;

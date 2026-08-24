@@ -86,7 +86,14 @@ async def _read_raw(request: Request, settings: Settings) -> bytearray:
 
 class _MultipartSink:
     _AUDIO_FIELDS = {"audio", "file"}
-    _TEXT_FIELDS = {"contact_id", "encoding", "sample_rate", "channels"}
+    _TEXT_FIELDS = {
+        "channels",
+        "consent_reference",
+        "contact_id",
+        "encoding",
+        "persistence_mode",
+        "sample_rate",
+    }
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings

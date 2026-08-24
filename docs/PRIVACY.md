@@ -21,6 +21,8 @@ Mixed audio can infer attributes of the wrong person and unnecessarily process b
 
 ## Request lifecycle
 
+Every request declares a retention mode. Omission means `none`. `result` retains only the structured inference; `result_and_audio` additionally requires a consent reference and stores only its SHA-256, never the reference text. Deployment enablement does not change the per-request default.
+
 ```text
 socket chunks
     -> bounded bytearray
@@ -30,20 +32,23 @@ socket chunks
     -> optional five-second inference window
     -> in-process local model
     -> aggregate response
+    -> optional PostgreSQL result / S3 encoded-audio commit
     -> best-effort overwrite and release in finally
 ```
 
 Application behavior:
 
-- REST and WebSocket input is buffered in memory only. Application code creates no audio files.
+- Mode `none` keeps REST and WebSocket input in request memory only. Application code creates no temporary audio files.
+- Mode `result` writes the response and manifest to PostgreSQL but no audio object.
+- Mode `result_and_audio` writes the original bounded REST body or coalesced live PCM segments to S3-compatible storage. PostgreSQL stores object keys, hashes, and exact logical chunk offsets; it never stores audio BLOBs.
 - WebSocket audio is retained only for that active session, because progressive predictions use the cumulative signal.
 - FFmpeg receives compressed bytes through stdin and returns float PCM through stdout. It is invoked without metadata copying.
-- Runtime inference is local. `HF_HUB_OFFLINE=1` and baked model artifacts prevent model-host uploads.
+- Runtime inference is local. `HF_HUB_OFFLINE=1`, `HF_HUB_DISABLE_TELEMETRY=1`, `ORT_DISABLE_TELEMETRY=1`, and baked/mounted model artifacts prevent model-host or ONNX Runtime telemetry uploads.
 - Mutable encoded buffers are overwritten with zeros and cleared. Decoded and selected NumPy arrays are filled with zeros in `finally`, including error paths after decoding.
-- The application does not cache waveforms, embeddings, model outputs, or contact profiles.
+- The application does not cache waveforms or embeddings. Model outputs/contact UUIDs are durable only for an explicitly retained session.
 - The API response returns `contact_id`; normal logs exclude it and all predictions.
 - The browser requests microphone permission only after an explicit user action. A completed recording blob remains only in the current page state while selected. Live PCM is held in one roughly 250 ms application batch, a browser WebSocket queue bounded to 512 KiB before the client fails closed, and the backend's bounded active-session buffer. Mode changes, cancellation, errors, and teardown release browser tracks, nodes, arrays, sockets, timers, and object URLs on a best-effort basis.
-- Live capture does not automatically reconnect or replay. Reconstructing a cumulative session would require retaining caller audio, so a failed live session must be restarted explicitly.
+- Live capture does not automatically reconnect or replay. Any retained REST or live request that does not reach a final result deletes its partial objects and metadata; a failed live session must be restarted explicitly.
 
 ## What zeroization does not guarantee
 
@@ -53,7 +58,7 @@ The Docker deployment limits exposure by running as a non-root user, dropping ca
 
 ## Logging and observability
 
-Structured logs contain UTC timestamp, severity, event, request ID, method, bounded path label, HTTP status, total duration, model name, inference duration, audio duration, and quality class. They do not intentionally include:
+Structured logs contain UTC timestamp, severity, event, request ID, method, bounded path label, HTTP status, total duration, model name, inference duration, audio duration, and quality class. Persistence lifecycle events additionally contain the random analysis/session UUID so operators can reconcile failed writes/deletes; treat it as pseudonymous metadata. Logs do not intentionally include:
 
 - request bodies or audio samples;
 - HTTP query strings;
@@ -63,7 +68,7 @@ Structured logs contain UTC timestamp, severity, event, request ID, method, boun
 
 Prometheus metrics use bounded labels for path, status, backend, quality, and stable error code. They contain no per-caller identifier. Unexpected exception logs include a stack trace; application exceptions do not include payload content, but dependency messages should still be reviewed for leakage.
 
-The supplied frontend proxy disables Nginx access logging for `/api/analyze` and the WebSocket endpoint. Its remaining access logs record the normalized path only, not the query string. This prevents uploaded filenames, contact IDs, and analysis payloads from being written by the proxy's default request log. Container-platform log collection still needs access control and an appropriate retention policy.
+The supplied frontend proxy disables Nginx access logging for `/api/analyze`, stored-analysis routes, and the WebSocket endpoint. Its remaining access logs record the normalized path only, not the query string. This prevents uploaded filenames, contact IDs, analysis IDs, and payloads from being written by the proxy's default request log. Container-platform log collection still needs access control and an appropriate retention policy.
 
 Configure ingress, WAF, service mesh, APM, tracing, and support tooling to exclude request/response bodies, query strings, `X-Contact-ID`, WebSocket frames, and multipart content. Protect logs and metrics with access control and short, justified retention.
 
@@ -71,11 +76,15 @@ Configure ingress, WAF, service mesh, APM, tracing, and support tooling to exclu
 
 The application serves plaintext HTTP/WebSocket on port 8000. Terminate TLS and authenticate callers at a trusted ingress; use TLS or mTLS from ingress to service where threat modeling requires it. Apply namespace/network policy so only the media platform and monitoring scraper can connect. Do not expose `/metrics` publicly.
 
-The supplied image is built with model files embedded under `/opt/models`. Audio is not embedded. The first build contacts Hugging Face and package repositories; the running model does not require external services. Build logs and caches should be access-controlled, although they contain model artifacts rather than caller audio.
+The supplied image is built with model files embedded under `/opt/models`. Audio is not embedded. The first build contacts Hugging Face and package repositories; runtime model inference stays offline. When persistence is deployment-enabled, PostgreSQL and S3-compatible storage are runtime dependencies only for opted-in sessions.
+
+Compose binds the API, object console, and frontend to loopback while keeping PostgreSQL and the S3 API private to the Compose network. Its MinIO service is a local visualization, not the production storage recommendation: the upstream repository was archived in April 2026. Production should use an actively maintained managed S3 service with TLS/private endpoints, tenant-scoped IAM, bucket policies, versioning decisions, access logging that excludes sensitive metadata, and SSE-KMS. Object keys contain random analysis/segment UUIDs and dates, never contact IDs or filenames. Database volumes and backups also need encryption, access control, tested deletion, and bounded retention.
 
 ## Retention and deletion
 
-The application's intended audio retention is the duration of one request/session plus cleanup. There is no application database and therefore no service-side deletion API. `contact_id`, output, and any caller association may be stored by the calling system; that system must define its own retention, deletion, subject-access, and audit processes.
+Mode `none` retains application audio only for one request/session plus cleanup. Result-only sessions default to 30 days. Result-and-audio sessions default to 24 hours for both their object bytes and associated result. `DELETE /analyses/{analysis_id}` removes S3 objects before deleting PostgreSQL metadata and is idempotent at the storage-service layer. The local cleanup loop applies TTLs, and the Compose-owned bucket gets a coarse lifecycle backstop one day beyond the audio TTL. Production should run a separately scaled, retryable retention worker and configure an independently monitored S3 lifecycle rule as a second safety net.
+
+The calling system may separately store `contact_id`, outputs, or a caller association and therefore must define its own retention, deletion, subject-access, and audit processes. Deleting this service's analysis does not delete external copies. Backups, replicas, object versions, and legal holds require an explicit erasure policy.
 
 The app terminates an HTTP upload after ten seconds without a body chunk and a WebSocket after 30 seconds without a frame or 120 seconds total by default. It also enforces byte and 30-second audio limits. Keep stricter, independently enforced ingress idle and maximum connection durations before production; application timers are defense in depth, not protection against connections that never reach the process.
 
@@ -93,10 +102,12 @@ Before use, evaluate consented caller-only data across lawful and relevant langu
 - Document purpose, lawful basis/consent, notices, opt-out, data controller/processor roles, and downstream retention.
 - Use caller-only channel routing and test it continuously.
 - Add authenticated TLS/mTLS ingress, tenant authorization, quotas, rate limiting, connection limits, and network policy.
+- Enforce tenant-scoped history/delete authorization; the loopback demo endpoints have no built-in identity layer.
+- Bind audio retention to a validated consent/policy record and keep the UI default at `none`.
 - Disable request/response/WebSocket body capture throughout ingress, APM, tracing, support tools, and crash reporting.
 - Disable or encrypt swap and core dumps; restrict node debugging and memory inspection.
 - Bound HTTP/WebSocket idle and wall-clock lifetime at ingress as well as in the application.
-- Encrypt any downstream result storage; separate identity maps; apply deletion and access controls.
+- Use managed PostgreSQL/S3 with encryption, private networking, narrowly scoped credentials, backup/replica deletion, retention jobs, and audit controls.
 - Audit model/data licenses and notices; inventory exact artifact hashes.
 - Run security scanning, dependency/model provenance checks, incident response exercises, and privacy review on every model change.
 - Monitor only aggregate performance, drift, quality, coverage, calibration, and subgroup safety; avoid raw-audio sampling in production.

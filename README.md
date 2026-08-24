@@ -1,6 +1,6 @@
 # Voice Contact Attribute Service
 
-A request-scoped FastAPI service that estimates an adult caller's perceived binary voice presentation and age bracket from speech. It accepts uploaded or streamed audio, detects unusable or degraded audio, abstains when confidence is low, and exposes health, readiness, JSON logs, and Prometheus metrics.
+A FastAPI service that estimates an adult caller's perceived binary voice presentation and age bracket from uploaded, recorded, or live-streamed speech. It detects unusable audio, abstains when confidence is low, and defaults to no retention. A user can explicitly retain results or consent-linked audio through PostgreSQL metadata and S3-compatible object storage.
 
 > The API field is named `gender` to satisfy the required contract. It is a binary acoustic estimate of how a voice presents to the training labels, not a determination of gender identity, sex, pronouns, or legal status. Do not use it for consequential, discriminatory, eligibility, pricing, employment, insurance, medical, or legal decisions.
 
@@ -9,6 +9,8 @@ A request-scoped FastAPI service that estimates an adult caller's perceived bina
 - `POST /analyze` for raw HTTP bodies and streaming-parsed multipart uploads.
 - `WS /ws/analyze` for progressive predictions over raw PCM, μ-law, or A-law chunks.
 - A responsive React/Vite/SCSS web client for upload, record-then-analyze, raw-PCM live streaming, progressive results, and actionable error states.
+- Per-request `none`, `result`, and consent-gated `result_and_audio` persistence modes; `none` is always the default.
+- PostgreSQL manifests plus S3 audio objects, one-second physical WebSocket segments, logical chunk offsets/checksums, history, and delete-now controls.
 - Native WAV/PCM/G.711 decoding plus FFmpeg fallback for common compressed containers and codecs.
 - Quality gating for short, quiet, non-speech, noisy, clipped, low-frequency-heavy, and narrowband input.
 - One pinned SpeechBrain ECAPA-TDNN encoder pass shared by Apache-2.0 griko SVM/SVR attribute heads.
@@ -27,7 +29,7 @@ Prerequisites are Docker with Compose v2, enough disk for the Python/PyTorch ima
 docker compose up --build
 ```
 
-The first build is slower because it downloads CPU PyTorch wheels and model artifacts. Once startup logs contain `service_ready`, verify the service:
+Compose starts the API, frontend, PostgreSQL, and a local S3-compatible object store. The first build is slower because it downloads CPU PyTorch wheels and model artifacts. Once startup logs contain `service_ready`, verify the service:
 
 ```bash
 curl -fsS http://localhost:8000/healthz
@@ -36,7 +38,9 @@ curl -fsS http://localhost:8000/readyz
 
 Both should return HTTP 200. Interactive OpenAPI documentation is available at `http://localhost:8000/docs`.
 
-Open the web interface at [http://localhost:3000](http://localhost:3000). Select or drag in an M4A, WAV, MP3, OGG, FLAC, or WebM recording; the browser sends it directly to the service without storing it. Compressed recordings such as M4A are accepted through the backend's FFmpeg decoder and may be conservatively marked `degraded`.
+Open the web interface at [http://localhost:3000](http://localhost:3000). Select or drag in an M4A, WAV, MP3, OGG, FLAC, or WebM recording. M4A can be uploaded directly—host FFmpeg is not required. The bundled decoder probes source codec/rate, and use of FFmpeg alone no longer marks a good recording degraded. Retention remains **None** unless the user changes it.
+
+The local object-store console is [http://localhost:9001](http://localhost:9001) (`voice-local` / `voice-local-development-only`). It is a development visualization only; use managed S3 with IAM/KMS in production. PostgreSQL stays private to the Compose network; inspect it with `docker compose exec postgres psql -U voice_attributes -d voice_attributes`.
 
 The **Record** mode captures a complete browser-supported clip and analyzes it through REST. **Live** uses an AudioWorklet to send raw microphone PCM in roughly 250 ms WebSocket frames and replaces provisional estimates until the final result arrives. Microphone access works over localhost for development and requires HTTPS/WSS when deployed. See [docs/STREAMING.md](docs/STREAMING.md) for the browser and real call-media designs.
 
@@ -82,6 +86,25 @@ curl -sS -X POST http://localhost:8000/analyze \
   -F 'contact_id=123e4567-e89b-12d3-a456-426614174000'
 ```
 
+To retain the structured result but not audio:
+
+```bash
+curl -sS -X POST http://localhost:8000/analyze \
+  -H 'X-Persistence-Mode: result' \
+  -F 'audio=@samples/caller.wav;type=audio/wav'
+```
+
+To demonstrate consent-gated audio retention:
+
+```bash
+curl -sS -X POST http://localhost:8000/analyze \
+  -H 'X-Persistence-Mode: result_and_audio' \
+  -H 'X-Consent-Reference: demo-approval-001' \
+  -F 'audio=@samples/caller.wav;type=audio/wav'
+```
+
+The retained response includes `analysis_id` and a `persistence` receipt. Inspect its object segments and logical chunk offsets with `GET /analyses/{analysis_id}`, list retained analyses with `GET /analyses`, or erase both objects and metadata with `DELETE /analyses/{analysis_id}`. The consent reference itself is never stored; only its SHA-256 is recorded.
+
 A successful response has this shape:
 
 ```json
@@ -113,7 +136,7 @@ curl -sS -X POST \
 
 ## Frontend development
 
-The production frontend is built into a small Nginx container and proxies only the analyzer, readiness, and WebSocket paths to FastAPI. Browser requests remain same-origin, so the backend does not need permissive CORS settings. Its permissions policy allows microphone access only to the same origin. The backend port and UI port are bound to loopback by default.
+The production frontend is built into a small Nginx container and proxies the analyzer, readiness, WebSocket, persistence-capability, and retained-analysis paths to FastAPI. Browser requests remain same-origin, so the backend does not need permissive CORS settings. Its permissions policy allows microphone access only to the same origin. The backend port and UI port are bound to loopback by default.
 
 For Vite hot reload, keep the backend running and start the development server in another terminal:
 
@@ -123,19 +146,28 @@ npm ci
 npm run dev
 ```
 
-Then open `http://localhost:5173`. Vite proxies `/api` to `http://127.0.0.1:8000`. The client keeps the selected file and result only in React memory: it does not use local storage, analytics, a service worker, or filename logging.
+Then open `http://localhost:5173`. Vite proxies `/api` to `http://127.0.0.1:8000`. The client keeps the selected file and result only in React memory: it does not use browser local storage, analytics, a service worker, or filename logging. Server-side retention occurs only when the visible per-request control is changed from `None`.
 
 ## Model and decision rationale
 
 The selected pipeline runs the pinned `speechbrain/spkrec-ecapa-voxceleb` encoder once and applies the pinned `griko/gender_cls_svm_ecapa_voxceleb` and `griko/age_reg_svr_ecapa_voxceleb2` heads to the same 192-dimensional embedding. Model repositories declare Apache-2.0, which permits commercial use subject to its conditions. The service repository is MIT licensed. Model and dataset licenses are separate, and neither grants privacy, publicity, voice, or training-data rights; production adoption still requires legal review and preservation of required notices.
 
-The durable comparison—including audEERING 6/24-layer models, ChunkFormer, openSMILE/acoustic features, and two independent models—is in [ADR-001](docs/ADR-001-model-selection.md). The concise architecture write-up is in [DESIGN.md](docs/DESIGN.md), and operational model limitations are in [MODEL_CARD.md](docs/MODEL_CARD.md).
+The runnable ECAPA stack is a baseline, not a claim that it is universally best. The current production target is an owned WavLM Base+ backbone with logistics-trained, calibrated joint heads, exported through the included `wavlm_onnx` adapter. Because those heads must be trained and evaluated rather than downloaded, Compose keeps ECAPA as the working default. audEERING devAIce is the best turnkey paid evaluation; its public weights cannot be used commercially. The ranked evidence and promotion gates are in [ADR-002](docs/ADR-002-production-model-strategy.md); the original baseline record remains in [ADR-001](docs/ADR-001-model-selection.md).
+
+The Docker runtime includes ONNX Runtime, but it intentionally does not pretend that bare public WavLM backbone weights are a deployable demographic model. After training and exporting the owned graph described in ADR-002, place it at `models/wavlm/model.onnx` and launch the supplied override:
+
+```bash
+WAVLM_MODEL_REVISION=logistics-v1 \
+  docker compose -f docker-compose.yml -f docker-compose.wavlm.yml up --build
+```
+
+The override mounts the graph read-only and selects `wavlm_onnx`. Startup fails if the artifact is absent or its input/output contract is wrong; it never silently falls back to ECAPA.
 
 During the Docker build, every model file is fetched from an immutable commit and checked against a hard-coded SHA-256. The griko heads arrive as joblib/pickle objects, which can execute code while loading. They are deserialized only in the disposable model-builder stage, validated against scikit-learn predictions, and exported to numeric `.npz`. The runtime image contains no joblib, pandas, or scikit-learn and loads the heads using `numpy.load(..., allow_pickle=False)`. Build in isolated CI: conversion removes runtime pickle exposure, not the risk at build time. The pinned upstream SpeechBrain PyTorch checkpoints also remain serialized model artifacts and are hash-verified.
 
 ## Confidence and quality
 
-Gender confidence is the selected SVM class probability after normalization and quality discounting. Age is first regressed in years, mapped to an adult bracket, and assigned probability mass using a configurable ten-year residual sigma. Implausible estimates outside 18–120 abstain. A degraded signal multiplies both scores by `0.75`. Scores below their thresholds become `unknown` with confidence `0.0`; insufficient audio skips model inference entirely. FFmpeg-fallback input is conservatively degraded because the service does not trust caller-omitted source-bandwidth metadata.
+Gender confidence is the selected SVM class probability after normalization and quality discounting. Age is first regressed in years, mapped to an adult bracket, and assigned probability mass using a configurable ten-year residual sigma. Implausible estimates outside 18–120 abstain. A degraded signal multiplies both scores by `0.75`. Scores below their thresholds become `unknown` with confidence `0.0`; insufficient audio skips model inference entirely. Compressed audio is degraded only when probed source metadata is missing/narrowband or measured signal checks warrant it—not merely because FFmpeg decoded it.
 
 These scores are not proof, and they have not yet been calibrated on logistics calls. Treat `unknown` as a normal outcome. Before launch, evaluate calibration and subgroup error on consented, caller-only recordings from target carriers, languages, devices, and noise conditions.
 
@@ -145,11 +177,13 @@ Docker Compose provides safe CPU defaults. Important environment variables are:
 
 | Variable | Default | Purpose |
 | --- | ---: | --- |
+| `MODEL_BACKEND` | `ecapa` | Runnable `ecapa` baseline or an owned `wavlm_onnx` artifact. |
+| `WAVLM_MODEL_PATH` | `/opt/models/wavlm/model.onnx` | Graph containing WavLM, owned heads, and calibration. |
 | `MODEL_DEVICE` | `cpu` | Torch device, for example `cpu` or `cuda` in a GPU image. |
 | `TORCH_THREADS` | `2` | Intra-op Torch CPU threads. |
 | `INFERENCE_CONCURRENCY` | `1` | Concurrent inferences per process. The estimator itself is serialized. |
 | `QUEUE_TIMEOUT_SECONDS` | `1.0` | Wait before returning retriable `SERVICE_BUSY`. |
-| `INFERENCE_WINDOW_SECONDS` | `5.0` | Highest-energy inference window selected from longer audio. |
+| `INFERENCE_WINDOW_SECONDS` | `5.0` | Speech-evidence window selected from longer audio. |
 | `MAX_AUDIO_SECONDS` | `30` | Maximum decoded or streamed duration. |
 | `MAX_UPLOAD_BYTES` | `12582912` | Maximum audio payload bytes. |
 | `MIN_AUDIO_SECONDS` | `1.25` | Minimum decoded duration. |
@@ -163,6 +197,14 @@ Docker Compose provides safe CPU defaults. Important environment variables are:
 | `WS_MAX_SESSION_SECONDS` | `120.0` | Hard wall-clock limit for one WebSocket session. |
 | `WS_ALLOWED_ORIGINS` | local UI origins | Comma-separated browser origins allowed to open WebSockets; origin-less server adapters remain supported. |
 | `LOG_LEVEL` | `INFO` | JSON log level. |
+| `PERSISTENCE_ENABLED` | `false` in code; `true` in Compose | Deployment maximum; every request still defaults to `none`. |
+| `DATABASE_URL` | local Compose PostgreSQL | Result and audio-manifest metadata. |
+| `S3_ENDPOINT_URL`, `S3_BUCKET` | local Compose object store | S3-compatible retained-audio location. |
+| `AUDIO_RETENTION_HOURS` | `24` | TTL for result-and-audio sessions. |
+| `RESULT_RETENTION_DAYS` | `30` | TTL for result-only sessions. |
+| `STORAGE_SEGMENT_SECONDS` | `1.0` | Physical object target for live PCM chunks. |
+| `STORAGE_OPERATION_TIMEOUT_SECONDS` | `5.0` | Per-attempt PostgreSQL/S3 operation timeout. |
+| `STORAGE_WORKER_THREADS` | `4` | Dedicated blocking S3 workers per API replica. |
 
 Invalid configuration fails startup. Keep the default one Uvicorn worker per container so the model is loaded once per replica; scale with more containers.
 
@@ -214,7 +256,7 @@ The JSON report includes accuracy with unknown counted as error, coverage, accur
 
 ## Privacy and production checklist
 
-Audio stays in memory for the request or WebSocket session, is not written by application code, is never sent to a model host, and is best-effort overwritten and released in `finally` blocks. The container runs read-only as a non-root user with `/tmp` on tmpfs. Managed runtimes, kernel buffers, allocators, crash dumps, infrastructure logs, and observability agents can still copy memory, so this is data minimization rather than a forensic zeroization guarantee.
+With mode `none`, audio stays in memory only for the request or WebSocket session and is best-effort overwritten in `finally` blocks. With explicit `result_and_audio`, encoded bytes are written to S3-compatible storage and governed by the returned expiry/delete controls. Runtime inference remains local and never sends audio to a model host. This is data minimization, not a forensic zeroization guarantee.
 
 Before production, add TLS at the ingress, authentication, tenant authorization, rate limits, network policies, request-body logging exclusions, crash-dump controls, and jurisdiction-specific consent/notice. Full controls and the threat boundary are in [docs/PRIVACY.md](docs/PRIVACY.md).
 
@@ -222,6 +264,8 @@ Before production, add TLS at the ingress, authentication, tenant authorization,
 
 - [API contract and examples](docs/API.md)
 - [Model-selection decision record](docs/ADR-001-model-selection.md)
+- [Production model strategy and ranked alternatives](docs/ADR-002-production-model-strategy.md)
+- [Opt-in PostgreSQL/S3 persistence decision](docs/ADR-003-opt-in-persistence.md)
 - [200-word design write-up](docs/DESIGN.md)
 - [Privacy and data lifecycle](docs/PRIVACY.md)
 - [Browser and telephony streaming design](docs/STREAMING.md)

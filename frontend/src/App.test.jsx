@@ -24,6 +24,15 @@ const successfulResult = {
   audio_quality: "degraded",
 };
 
+const persistenceCapabilities = {
+  enabled: true,
+  maximum_mode: "result_and_audio",
+  default_mode: "none",
+  audio_retention_hours: 24,
+  result_retention_days: 30,
+  audio_requires_consent_reference: true,
+};
+
 function renderApp() {
   return render(
     <StrictMode>
@@ -32,11 +41,15 @@ function renderApp() {
   );
 }
 
-function mockAnalyzer(analyzerPromise = Promise.resolve(response(successfulResult))) {
+function mockAnalyzer(
+  analyzerPromise = Promise.resolve(response(successfulResult)),
+  capabilitiesPromise = Promise.resolve(response(persistenceCapabilities)),
+) {
   const fetchMock = vi.fn((url) => {
     if (url === "/api/readyz") {
       return Promise.resolve(response({ status: "ready" }));
     }
+    if (url === "/api/persistence/capabilities") return capabilitiesPromise;
     return analyzerPromise;
   });
   vi.stubGlobal("fetch", fetchMock);
@@ -134,9 +147,190 @@ describe("Audio analyzer", () => {
       "123e4567-e89b-12d3-a456-426614174000",
     );
     expect(options.headers).not.toHaveProperty("Content-Type");
+    expect(options.headers["X-Persistence-Mode"]).toBe("none");
 
     await user.click(screen.getByRole("button", { name: /analyze another/i }));
     expect(screen.getByLabelText(/contact id/i)).toHaveValue("");
+  });
+
+  it("requires retention acknowledgement and sends consent headers for stored audio", async () => {
+    const user = userEvent.setup();
+    const persistedResult = {
+      ...successfulResult,
+      analysis_id: "analysis-42",
+      persistence: {
+        mode: "result_and_audio",
+        status: "stored",
+        chunks_received: 8,
+        chunks_stored: 8,
+        segments_stored: 2,
+        bytes_stored: 4096,
+        audio_expires_at: "2026-09-24T10:00:00Z",
+        result_expires_at: "2026-11-24T10:00:00Z",
+      },
+    };
+    const fetchMock = mockAnalyzer(Promise.resolve(response(persistedResult)));
+    renderApp();
+
+    const file = new File(["audio"], "caller.m4a", { type: "audio/mp4" });
+    await user.upload(screen.getByLabelText(/browse files/i), file);
+    await user.click(await screen.findByRole("radio", { name: /store result \+ audio/i }));
+
+    expect(screen.getByRole("button", { name: /analyze audio/i })).toBeDisabled();
+    expect(screen.getByText(/confirmation and reference are required/i)).toBeVisible();
+
+    await user.click(screen.getByRole("checkbox", { name: /confirm caller consent/i }));
+    await user.type(screen.getByLabelText(/consent reference/i), "  approval-482  ");
+    expect(screen.getByRole("button", { name: /analyze audio/i })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: /analyze audio/i }));
+
+    expect(await screen.findByText("Storage confirmed")).toBeVisible();
+    expect(screen.getByText("analysis-42")).toBeVisible();
+    expect(screen.getByText("4.0 KB")).toBeVisible();
+    const [, options] = analyzerCalls(fetchMock)[0];
+    expect(options.headers["X-Persistence-Mode"]).toBe("result_and_audio");
+    expect(options.headers["X-Consent-Reference"]).toBe("approval-482");
+  });
+
+  it("only offers retention modes allowed by server capabilities", async () => {
+    const user = userEvent.setup();
+    const fetchMock = mockAnalyzer(
+      undefined,
+      Promise.resolve(
+        response({
+          ...persistenceCapabilities,
+          maximum_mode: "result",
+        }),
+      ),
+    );
+    renderApp();
+
+    expect(await screen.findByRole("radio", { name: /^store result/i })).toBeVisible();
+    expect(screen.queryByRole("radio", { name: /store result \+ audio/i })).not.toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /do not store/i })).toBeChecked();
+
+    const file = new File(["audio"], "caller.wav", { type: "audio/wav" });
+    await user.upload(screen.getByLabelText(/browse files/i), file);
+    await user.click(screen.getByRole("button", { name: /analyze audio/i }));
+
+    await screen.findByRole("heading", { name: /contact attributes/i });
+    const [, options] = analyzerCalls(fetchMock)[0];
+    expect(options.headers["X-Persistence-Mode"]).toBe("none");
+  });
+
+  it("loads stored analysis detail and confirms deletion before calling the API", async () => {
+    const user = userEvent.setup();
+    const stored = {
+      analysis_id: "analysis-history-7",
+      contact_id: successfulResult.contact_id,
+      created_at: "2026-08-24T08:30:00Z",
+      status: "completed",
+      mode: "result_and_audio",
+      result: successfulResult,
+      persistence: {
+        session_id: "analysis-history-7",
+        mode: "result_and_audio",
+        status: "completed",
+        segment_count: 3,
+        audio_bytes: 8192,
+      },
+    };
+    const fetchMock = vi.fn((url, options = {}) => {
+      if (url === "/api/readyz") return Promise.resolve(response({ status: "ready" }));
+      if (url === "/api/persistence/capabilities") {
+        return Promise.resolve(response(persistenceCapabilities));
+      }
+      if (url === "/api/analyses" && !options.method) {
+        return Promise.resolve(response({ analyses: [stored] }));
+      }
+      if (url === "/api/analyses/analysis-history-7" && !options.method) {
+        return Promise.resolve(response({
+          ...stored,
+          segments: [
+            {
+              sequence: 0,
+              object_key: "voice-attributes/v1/analysis-history-7/segments/0000.pcm",
+              byte_start: 0,
+              byte_end: 8192,
+              byte_size: 8192,
+              logical_chunks: [
+                {
+                  chunk_index: 0,
+                  source_byte_start: 0,
+                  source_byte_end: 4096,
+                  segment_byte_start: 0,
+                  segment_byte_end: 4096,
+                },
+              ],
+            },
+          ],
+        }));
+      }
+      if (url === "/api/analyses/analysis-history-7" && options.method === "DELETE") {
+        return Promise.resolve(response(null, { status: 204 }));
+      }
+      return Promise.resolve(response(successfulResult));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderApp();
+
+    await user.click(screen.getByRole("button", { name: /view history/i }));
+    const historyItem = await screen.findByRole("button", { name: /analysis-history-7/i });
+    await user.click(historyItem);
+    expect(screen.getByLabelText(/stored analysis detail/i)).toHaveTextContent("8.0 KB");
+    expect(screen.getByLabelText(/stored analysis detail/i)).toHaveTextContent("31-45 · 41%");
+    expect(await screen.findByText(/voice-attributes\/v1\/analysis-history-7/i)).toBeVisible();
+    expect(screen.getByText(/chunk 0: source 0–4096; segment 0–4096/i)).toBeVisible();
+
+    await user.click(screen.getByRole("button", { name: /^delete$/i }));
+    expect(fetchMock).not.toHaveBeenCalledWith(
+      "/api/analyses/analysis-history-7",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+    await user.click(screen.getByRole("button", { name: /confirm delete/i }));
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/analyses/analysis-history-7",
+        expect.objectContaining({ method: "DELETE" }),
+      );
+    });
+    expect(await screen.findByText("Stored analysis deleted.")).toBeVisible();
+    expect(screen.queryByRole("button", { name: /analysis-history-7/i })).not.toBeInTheDocument();
+  });
+
+  it("labels a result-only history expiry as result retention", async () => {
+    const user = userEvent.setup();
+    const stored = {
+      analysis_id: "analysis-result-only",
+      contact_id: successfulResult.contact_id,
+      created_at: "2026-08-24T08:30:00Z",
+      expires_at: "2026-09-24T08:30:00Z",
+      status: "completed",
+      mode: "result",
+      result: successfulResult,
+      segment_count: 0,
+      audio_bytes: 0,
+    };
+    const fetchMock = vi.fn((url) => {
+      if (url === "/api/readyz") return Promise.resolve(response({ status: "ready" }));
+      if (url === "/api/persistence/capabilities") {
+        return Promise.resolve(response(persistenceCapabilities));
+      }
+      if (url === "/api/analyses") return Promise.resolve(response({ items: [stored] }));
+      if (url === "/api/analyses/analysis-result-only") {
+        return Promise.resolve(response({ ...stored, segments: [] }));
+      }
+      return Promise.resolve(response(successfulResult));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    renderApp();
+
+    await user.click(screen.getByRole("button", { name: /view history/i }));
+    await user.click(await screen.findByRole("button", { name: /analysis-result-only/i }));
+    const detail = await screen.findByLabelText(/stored analysis detail/i);
+    expect(detail).toHaveTextContent("Result expires");
+    expect(detail).not.toHaveTextContent("Audio expires");
   });
 
   it("rejects oversized audio before making a request", async () => {
@@ -322,10 +516,30 @@ describe("Audio analyzer", () => {
       sequence: 1,
       is_final: false,
     };
-    const final = { ...progressive, sequence: 2, is_final: true };
+    const analysisId = "d18f3374-ee30-4cc9-863a-6574f0482e4d";
+    const storage = {
+      type: "storage",
+      analysis_id: analysisId,
+      persistence: {
+        mode: "result_and_audio",
+        status: "pending",
+        chunks_received: 2,
+        chunks_stored: 1,
+        segments_stored: 1,
+        bytes_stored: 8000,
+      },
+    };
+    const final = {
+      ...progressive,
+      sequence: 2,
+      is_final: true,
+      analysis_id: analysisId,
+      persistence: { ...storage.persistence, status: "stored", chunks_stored: 2 },
+    };
     vi.spyOn(LiveAnalysisSession.prototype, "start").mockImplementation(async function () {
       this.onState("streaming");
       this.onStats({ bytes: 16000, chunks: 2, elapsed: 1.5, level: 0.45, sampleRate: 48000 });
+      this.onStorage(storage);
       this.onPrediction(progressive);
     });
     vi.spyOn(LiveAnalysisSession.prototype, "finish").mockImplementation(async function () {
@@ -335,14 +549,20 @@ describe("Audio analyzer", () => {
 
     renderApp();
     await user.click(screen.getByRole("radio", { name: /^live/i }));
+    await user.click(await screen.findByRole("radio", { name: /store result \+ audio/i }));
+    await user.click(screen.getByRole("checkbox", { name: /confirm caller consent/i }));
+    await user.type(screen.getByLabelText(/consent reference/i), "live-consent-9");
     await user.click(screen.getByRole("button", { name: /start live analysis/i }));
 
     expect(await screen.findByText("Estimate may change")).toBeVisible();
     expect(screen.getByText(/live · update 1/i)).toBeVisible();
     expect(screen.getByText(/2 raw pcm chunks/i)).toBeVisible();
+    expect(screen.getByText("Storage in progress")).toBeVisible();
+    expect(screen.getByText(analysisId)).toBeVisible();
 
     await user.click(screen.getByRole("button", { name: /stop & finalize/i }));
     expect(await screen.findByText("Final result")).toBeVisible();
+    expect(screen.getByText("Storage confirmed")).toBeVisible();
     expect(screen.getByRole("button", { name: /analyze another/i })).toBeEnabled();
   });
 

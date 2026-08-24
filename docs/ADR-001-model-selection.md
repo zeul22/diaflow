@@ -1,6 +1,6 @@
 # ADR-001: Shared ECAPA encoder with SVM/SVR attribute heads
 
-- Status: Accepted
+- Status: Accepted as runnable baseline; production target superseded by ADR-002
 - Date: 2026-08-24
 - Owners: Voice platform
 - Review trigger: domain evaluation failure, p95 latency above the service objective, material license change, or a better commercially usable model
@@ -41,7 +41,7 @@ The same embedding feeds both heads, avoiding a second neural backbone. The upst
 2. Decode natively when possible or pass compressed input through bounded FFmpeg stdin/stdout pipes.
 3. Mix to mono, resample to 16 kHz, sanitize non-finite values, and cap duration.
 4. Compute signal-quality statistics. Return `unknown` before inference when speech is insufficient.
-5. Select the highest-energy five-second window from longer audio.
+5. Select the best speech-evidence five-second window from longer audio, with an energy fallback.
 6. Run ECAPA once, then the SVM and SVR heads.
 7. Map continuous age to an adult bracket, discount degraded audio, apply confidence thresholds, and abstain when needed.
 8. Overwrite mutable audio buffers and arrays in `finally` blocks.

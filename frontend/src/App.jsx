@@ -6,6 +6,15 @@ import {
   formatBytes,
   validateAudioFile,
 } from "./api/analyze.js";
+import {
+  PERSISTENCE_MODES,
+  PersistenceApiError,
+  deleteStoredAnalysis,
+  getPersistenceCapabilities,
+  getStoredAnalysis,
+  listStoredAnalyses,
+  persistenceModeIsAvailable,
+} from "./api/persistence.js";
 import { LiveAnalysisSession } from "./api/streamAnalysis.js";
 import {
   BrowserRecorder,
@@ -35,6 +44,54 @@ const QUALITY_COPY = {
 };
 
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const PERSISTENCE_OPTIONS = [
+  {
+    value: PERSISTENCE_MODES.NONE,
+    label: "Do not store",
+    detail: "Request-scoped audio and result",
+  },
+  {
+    value: PERSISTENCE_MODES.RESULT,
+    label: "Store result",
+    detail: "Attributes and operational metadata only",
+  },
+  {
+    value: PERSISTENCE_MODES.RESULT_AND_AUDIO,
+    label: "Store result + audio",
+    detail: "Requires caller consent or an approved retention basis",
+  },
+];
+
+const PERSISTENCE_LABELS = {
+  [PERSISTENCE_MODES.NONE]: "Not stored",
+  [PERSISTENCE_MODES.RESULT]: "Result only",
+  [PERSISTENCE_MODES.RESULT_AND_AUDIO]: "Result + audio",
+};
+
+function storedAnalysisId(analysis) {
+  return (
+    analysis?.analysis_id ||
+    analysis?.session_id ||
+    analysis?.persistence?.session_id ||
+    analysis?.id ||
+    ""
+  );
+}
+
+function storedAnalysisResult(analysis) {
+  return analysis?.result && typeof analysis.result === "object" ? analysis.result : analysis;
+}
+
+function formatStoredDate(value) {
+  if (!value) return "—";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "—";
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(date);
+}
 
 function WaveIcon() {
   return (
@@ -166,7 +223,93 @@ function PredictionCard({ label, prediction }) {
   );
 }
 
-function ResultsPanel({ result, headingRef, onReset, streamStats }) {
+function PersistenceSummary({ requestedMode, result, streamStats }) {
+  const raw = result.persistence;
+  const persistence = raw && typeof raw === "object" ? raw : {};
+  const candidateMode = persistence.mode || requestedMode || PERSISTENCE_MODES.NONE;
+  const mode = typeof candidateMode === "string" ? candidateMode : PERSISTENCE_MODES.NONE;
+  const candidateAnalysisId =
+    result.analysis_id || persistence.analysis_id || persistence.session_id || "";
+  const analysisId = typeof candidateAnalysisId === "string" ? candidateAnalysisId : "";
+  const candidateStatus =
+    persistence.status ||
+    (typeof raw === "string" ? raw : "") ||
+    (analysisId ? "completed" : mode === PERSISTENCE_MODES.NONE ? "not stored" : "requested");
+  const status = typeof candidateStatus === "string" ? candidateStatus : "requested";
+  const chunksReceived = persistence.chunks_received;
+  const chunksStored = persistence.chunks_stored;
+  const segmentCount = persistence.segments_stored ?? persistence.segment_count;
+  const audioBytes = persistence.bytes_stored ?? persistence.audio_bytes;
+  const legacyExpiresAt = persistence.expires_at;
+  const audioExpiresAt =
+    persistence.audio_expires_at ??
+    (mode === PERSISTENCE_MODES.RESULT_AND_AUDIO ? legacyExpiresAt : null);
+  const resultExpiresAt =
+    persistence.result_expires_at ??
+    (mode === PERSISTENCE_MODES.RESULT ? legacyExpiresAt : null);
+  const shouldShow = mode !== PERSISTENCE_MODES.NONE || Boolean(raw) || Boolean(analysisId);
+  if (!shouldShow) return null;
+
+  const inProgress = ["pending", "requested", "storing", "streaming"].includes(status);
+  const failed = status === "failed";
+  const partial = status === "partial";
+  const progressValue =
+    Number.isFinite(chunksReceived) && chunksReceived > 0 && Number.isFinite(chunksStored)
+      ? Math.min(100, Math.round((chunksStored / chunksReceived) * 100))
+      : failed
+        ? 0
+        : inProgress
+          ? undefined
+          : 100;
+  const progressLabel = failed
+    ? "Storage failed"
+    : partial
+      ? "Storage partially completed"
+    : inProgress
+      ? "Storage in progress"
+      : "Storage confirmed";
+
+  return (
+    <section className={`persistence-summary persistence-summary--${failed ? "failed" : status}`}>
+      <div className="persistence-summary__heading">
+        <div>
+          <span>Storage progress</span>
+          <strong>{progressLabel}</strong>
+        </div>
+        <span className="storage-status">{status.replaceAll("_", " ")}</span>
+      </div>
+      <div
+        className={`storage-progress${inProgress ? " storage-progress--active" : ""}`}
+        role="progressbar"
+        aria-label="Server-side storage progress"
+        aria-valuemin="0"
+        aria-valuemax="100"
+        aria-valuenow={progressValue}
+        aria-valuetext={progressLabel}
+      >
+        <span />
+      </div>
+      <dl>
+        <div><dt>Retention</dt><dd>{PERSISTENCE_LABELS[mode] || mode}</dd></div>
+        {analysisId ? <div><dt>Analysis ID</dt><dd title={analysisId}>{analysisId}</dd></div> : null}
+        {Number.isFinite(chunksReceived) ? <div><dt>Chunks received</dt><dd>{chunksReceived}</dd></div> : null}
+        {Number.isFinite(chunksStored) ? <div><dt>Chunks stored</dt><dd>{chunksStored}</dd></div> : null}
+        {Number.isFinite(segmentCount) ? <div><dt>Segments stored</dt><dd>{segmentCount}</dd></div> : null}
+        {Number.isFinite(audioBytes) ? <div><dt>Audio stored</dt><dd>{formatBytes(audioBytes)}</dd></div> : null}
+        {audioExpiresAt ? <div><dt>Audio expires</dt><dd>{formatStoredDate(audioExpiresAt)}</dd></div> : null}
+        {resultExpiresAt ? <div><dt>Result expires</dt><dd>{formatStoredDate(resultExpiresAt)}</dd></div> : null}
+        {mode === PERSISTENCE_MODES.RESULT_AND_AUDIO && inProgress && !Number.isFinite(segmentCount) ? (
+          <div><dt>Chunks sent</dt><dd>{streamStats?.chunks || 0}</dd></div>
+        ) : null}
+      </dl>
+      {!raw && mode !== PERSISTENCE_MODES.NONE ? (
+        <p>The request was sent with this retention choice; this server did not return storage metadata.</p>
+      ) : null}
+    </section>
+  );
+}
+
+function ResultsPanel({ result, headingRef, onReset, persistenceMode, storage, streamStats }) {
   const [copied, setCopied] = useState(false);
   const quality = QUALITY_COPY[result.audio_quality] || QUALITY_COPY.degraded;
   const isLive = result.type === "prediction";
@@ -242,6 +385,20 @@ function ResultsPanel({ result, headingRef, onReset, streamStats }) {
         </div>
       </dl>
 
+      <PersistenceSummary
+        requestedMode={persistenceMode}
+        result={
+          storage && result.type === "prediction"
+            ? {
+                ...result,
+                analysis_id: result.analysis_id || storage.analysis_id,
+                persistence: result.persistence || storage.persistence,
+              }
+            : result
+        }
+        streamStats={streamStats}
+      />
+
       <div className="responsible-use">
         <strong>Interpret carefully.</strong> Voice presentation is not gender identity, and
         these confidence scores are not yet calibrated for logistics calls. Do not use the
@@ -282,11 +439,299 @@ function EmptyResults() {
       <div className="privacy-card">
         <LockIcon />
         <div>
-          <strong>Request-scoped by design</strong>
-          <p>No browser persistence, analytics, or application-level audio storage.</p>
+          <strong>Ephemeral by default</strong>
+          <p>Nothing is stored unless you explicitly choose retention for this analysis.</p>
         </div>
       </div>
     </aside>
+  );
+}
+
+function StoredAnalysisDetail({ analysis, loading }) {
+  const result = storedAnalysisResult(analysis);
+  const persistence = analysis?.persistence || {};
+  const id = storedAnalysisId(analysis);
+  const gender = result?.gender;
+  const age = result?.age_bracket;
+  const mode = persistence.mode || analysis?.mode || PERSISTENCE_MODES.RESULT;
+  const status = persistence.status || analysis?.status || "completed";
+  const segments = Array.isArray(analysis?.segments) ? analysis.segments : [];
+  const audioExpiresAt = persistence.audio_expires_at;
+  const resultExpiresAt = persistence.result_expires_at;
+  const genericExpiresAt = persistence.expires_at || analysis?.expires_at;
+  const hasSpecificExpiry = Boolean(audioExpiresAt || resultExpiresAt);
+
+  function predictionCopy(prediction) {
+    if (!prediction || typeof prediction.prediction !== "string") return "—";
+    if (!Number.isFinite(prediction.confidence)) return prediction.prediction;
+    return `${prediction.prediction} · ${Math.round(prediction.confidence * 100)}%`;
+  }
+
+  return (
+    <aside className="history-detail" aria-label="Stored analysis detail">
+      <div className="history-detail__heading">
+        <div>
+          <span>Selected analysis</span>
+          <strong title={id}>{id || "Identifier unavailable"}</strong>
+        </div>
+        <span className="storage-status">{String(status).replaceAll("_", " ")}</span>
+      </div>
+      <dl>
+        <div><dt>Contact</dt><dd title={result?.contact_id}>{result?.contact_id || analysis?.contact_id || "—"}</dd></div>
+        <div><dt>Created</dt><dd>{formatStoredDate(analysis?.created_at || persistence.created_at)}</dd></div>
+        <div><dt>Voice presentation</dt><dd>{predictionCopy(gender)}</dd></div>
+        <div><dt>Age bracket</dt><dd>{predictionCopy(age)}</dd></div>
+        <div><dt>Audio quality</dt><dd>{result?.audio_quality || "—"}</dd></div>
+        <div><dt>Retention</dt><dd>{PERSISTENCE_LABELS[mode] || mode}</dd></div>
+        {Number.isFinite(persistence.segments_stored ?? persistence.segment_count ?? analysis?.segment_count) ? (
+          <div><dt>Segments</dt><dd>{persistence.segments_stored ?? persistence.segment_count ?? analysis.segment_count}</dd></div>
+        ) : null}
+        {Number.isFinite(persistence.bytes_stored ?? persistence.audio_bytes ?? analysis?.audio_bytes) ? (
+          <div><dt>Audio stored</dt><dd>{formatBytes(persistence.bytes_stored ?? persistence.audio_bytes ?? analysis.audio_bytes)}</dd></div>
+        ) : null}
+        {audioExpiresAt ? (
+          <div><dt>Audio expires</dt><dd>{formatStoredDate(audioExpiresAt)}</dd></div>
+        ) : null}
+        {resultExpiresAt ? (
+          <div><dt>Result expires</dt><dd>{formatStoredDate(resultExpiresAt)}</dd></div>
+        ) : null}
+        {!hasSpecificExpiry && genericExpiresAt ? (
+          <div>
+            <dt>{mode === PERSISTENCE_MODES.RESULT_AND_AUDIO ? "Audio + result expire" : "Result expires"}</dt>
+            <dd>{formatStoredDate(genericExpiresAt)}</dd>
+          </div>
+        ) : null}
+      </dl>
+      {loading ? <p className="segment-loading" role="status">Loading stored segment detail…</p> : null}
+      {segments.length ? (
+        <div className="segment-detail">
+          <strong>Stored audio segments</strong>
+          <ol>
+            {segments.map((segment, index) => (
+              <li key={`${segment.object_key || "segment"}-${segment.sequence ?? index}`}>
+                <div>
+                  <strong>Segment {Number.isFinite(segment.sequence) ? segment.sequence : index}</strong>
+                  <span>{Number.isFinite(segment.byte_size) ? formatBytes(segment.byte_size) : "—"}</span>
+                </div>
+                <code title={segment.object_key}>{segment.object_key || "Object key unavailable"}</code>
+                {Number.isFinite(segment.byte_start) && Number.isFinite(segment.byte_end) ? (
+                  <p>Stored byte range {segment.byte_start}–{segment.byte_end}</p>
+                ) : null}
+                {Array.isArray(segment.logical_chunks) && segment.logical_chunks.length ? (
+                  <ul>
+                    {segment.logical_chunks.map((chunk) => (
+                      <li key={`${chunk.chunk_index}-${chunk.segment_byte_start}`}>
+                        Chunk {chunk.chunk_index}: source {chunk.source_byte_start}–{chunk.source_byte_end}; segment {chunk.segment_byte_start}–{chunk.segment_byte_end}
+                      </li>
+                    ))}
+                  </ul>
+                ) : null}
+              </li>
+            ))}
+          </ol>
+        </div>
+      ) : null}
+    </aside>
+  );
+}
+
+function StoredAnalysisHistory({ refreshToken }) {
+  const [open, setOpen] = useState(false);
+  const [reloadToken, setReloadToken] = useState(0);
+  const [phase, setPhase] = useState("idle");
+  const [analyses, setAnalyses] = useState([]);
+  const [selectedId, setSelectedId] = useState("");
+  const [selectedDetail, setSelectedDetail] = useState(null);
+  const [detailPhase, setDetailPhase] = useState("idle");
+  const [confirmDeleteId, setConfirmDeleteId] = useState("");
+  const [deletingId, setDeletingId] = useState("");
+  const [historyError, setHistoryError] = useState("");
+  const [notice, setNotice] = useState("");
+  const detailControllerRef = useRef(null);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    const controller = new AbortController();
+
+    listStoredAnalyses({ signal: controller.signal })
+      .then((items) => {
+        setAnalyses(items);
+        setSelectedId((current) =>
+          current && items.some((item) => storedAnalysisId(item) === current) ? current : "",
+        );
+        setPhase("ready");
+      })
+      .catch((requestError) => {
+        if (requestError?.name === "AbortError") return;
+        const normalized =
+          requestError instanceof PersistenceApiError
+            ? requestError
+            : new PersistenceApiError("Stored-analysis history could not be loaded.");
+        setHistoryError(normalized.message);
+        setPhase("error");
+      });
+    return () => controller.abort();
+  }, [open, refreshToken, reloadToken]);
+
+  useEffect(() => () => detailControllerRef.current?.abort(), []);
+
+  const selectedSummary = analyses.find((analysis) => storedAnalysisId(analysis) === selectedId);
+  const selected =
+    selectedDetail && storedAnalysisId(selectedDetail) === selectedId
+      ? selectedDetail
+      : selectedSummary;
+
+  function toggleHistory() {
+    if (!open) {
+      setPhase("loading");
+      setHistoryError("");
+      setNotice("");
+    }
+    if (open) detailControllerRef.current?.abort();
+    setOpen((value) => !value);
+  }
+
+  async function selectAnalysis(analysisId) {
+    detailControllerRef.current?.abort();
+    setSelectedId(analysisId);
+    setSelectedDetail(null);
+    if (!analysisId) return;
+
+    const controller = new AbortController();
+    detailControllerRef.current = controller;
+    setDetailPhase("loading");
+    setHistoryError("");
+    try {
+      const detail = await getStoredAnalysis(analysisId, { signal: controller.signal });
+      if (detailControllerRef.current !== controller) return;
+      setSelectedDetail(detail);
+      setDetailPhase("ready");
+    } catch (requestError) {
+      if (requestError?.name === "AbortError") return;
+      const normalized =
+        requestError instanceof PersistenceApiError
+          ? requestError
+          : new PersistenceApiError("Stored-analysis detail could not be loaded.");
+      setHistoryError(normalized.message);
+      setDetailPhase("error");
+    } finally {
+      if (detailControllerRef.current === controller) detailControllerRef.current = null;
+    }
+  }
+
+  function refreshHistory() {
+    setPhase("loading");
+    setHistoryError("");
+    setNotice("");
+    setReloadToken((value) => value + 1);
+  }
+
+  async function removeAnalysis(analysisId) {
+    if (confirmDeleteId !== analysisId) {
+      setConfirmDeleteId(analysisId);
+      setNotice("Press Confirm delete to permanently remove this stored analysis and its retained audio.");
+      return;
+    }
+    setDeletingId(analysisId);
+    setHistoryError("");
+    setNotice("");
+    try {
+      await deleteStoredAnalysis(analysisId);
+      setAnalyses((current) => current.filter((item) => storedAnalysisId(item) !== analysisId));
+      if (selectedId === analysisId) {
+        setSelectedId("");
+        setSelectedDetail(null);
+      }
+      setConfirmDeleteId("");
+      setNotice("Stored analysis deleted.");
+    } catch (requestError) {
+      const normalized =
+        requestError instanceof PersistenceApiError
+          ? requestError
+          : new PersistenceApiError("The stored analysis could not be deleted.");
+      setHistoryError(normalized.message);
+    } finally {
+      setDeletingId("");
+    }
+  }
+
+  return (
+    <section className="history-panel" aria-labelledby="history-title">
+      <div className="history-panel__heading">
+        <div>
+          <p className="section-kicker">Retention controls</p>
+          <h2 id="history-title">Stored analyses</h2>
+          <p>Review server-side records and explicitly remove results or retained audio.</p>
+        </div>
+        <button className="secondary-button" type="button" onClick={toggleHistory}>
+          {open ? "Hide history" : "View history"}
+        </button>
+      </div>
+
+      {open ? (
+        <div className="history-panel__body">
+          <div className="history-toolbar">
+            <span>{phase === "ready" ? `${analyses.length} stored` : "Server-side history"}</span>
+            <button
+              className="text-button"
+              type="button"
+              disabled={phase === "loading"}
+              onClick={refreshHistory}
+            >
+              {phase === "loading" ? "Refreshing…" : "Refresh"}
+            </button>
+          </div>
+          {historyError ? <p className="history-message history-message--error" role="alert">{historyError}</p> : null}
+          {notice ? <p className="history-message" role="status">{notice}</p> : null}
+          {phase === "loading" && !analyses.length ? (
+            <div className="history-loading" role="status"><span className="spinner" /> Loading stored analyses…</div>
+          ) : null}
+          {phase === "ready" && !analyses.length ? (
+            <p className="history-empty">No stored analyses were returned. New requests still default to no retention.</p>
+          ) : null}
+          {analyses.length ? (
+            <div className="history-layout">
+              <ul className="history-list">
+                {analyses.map((analysis, index) => {
+                  const id = storedAnalysisId(analysis);
+                  const itemResult = storedAnalysisResult(analysis);
+                  const createdAt = analysis?.created_at || analysis?.persistence?.created_at;
+                  return (
+                    <li key={id || `${itemResult?.contact_id || "analysis"}-${index}`} className={selectedId === id ? "is-selected" : ""}>
+                      <button
+                        className="history-list__select"
+                        type="button"
+                        onClick={() => void selectAnalysis(id)}
+                        disabled={!id}
+                      >
+                        <strong>{itemResult?.contact_id || analysis?.contact_id || "Unknown contact"}</strong>
+                        <span>{formatStoredDate(createdAt)}</span>
+                        <small>{id || "Missing analysis ID"}</small>
+                      </button>
+                      <button
+                        className={`history-list__delete${confirmDeleteId === id ? " is-confirming" : ""}`}
+                        type="button"
+                        disabled={!id || deletingId === id}
+                        onClick={() => void removeAnalysis(id)}
+                      >
+                        {deletingId === id
+                          ? "Deleting…"
+                          : confirmDeleteId === id
+                            ? "Confirm delete"
+                            : "Delete"}
+                      </button>
+                    </li>
+                  );
+                })}
+              </ul>
+              {selected ? <StoredAnalysisDetail analysis={selected} loading={detailPhase === "loading"} /> : (
+                <div className="history-detail history-detail--empty">Select an analysis to inspect its stored result and retention metadata.</div>
+              )}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </section>
   );
 }
 
@@ -360,6 +805,88 @@ function SourceSelector({ value, disabled, onChange }) {
           </label>
         );
       })}
+    </fieldset>
+  );
+}
+
+function PersistenceControls({
+  acknowledged,
+  capabilitiesPhase,
+  consentReference,
+  disabled,
+  maximumMode,
+  mode,
+  onAcknowledgedChange,
+  onConsentReferenceChange,
+  onModeChange,
+}) {
+  const storesAudio = mode === PERSISTENCE_MODES.RESULT_AND_AUDIO;
+  const ready = !storesAudio || (acknowledged && consentReference.trim());
+  const availableOptions = PERSISTENCE_OPTIONS.filter((option) =>
+    persistenceModeIsAvailable(option.value, maximumMode),
+  );
+  const availabilityCopy =
+    capabilitiesPhase === "loading"
+      ? "Checking server storage"
+      : capabilitiesPhase === "error"
+        ? "Storage unavailable · default none"
+        : maximumMode === PERSISTENCE_MODES.NONE
+          ? "Server retention disabled"
+          : "Default: none";
+
+  return (
+    <fieldset className="persistence-controls" disabled={disabled}>
+      <div className="persistence-controls__heading">
+        <legend>Storage mode</legend>
+        <span role="status">{availabilityCopy}</span>
+      </div>
+      <div className="persistence-options">
+        {availableOptions.map((option) => (
+          <label key={option.value} className={mode === option.value ? "is-selected" : ""}>
+            <input
+              type="radio"
+              name="persistence-mode"
+              value={option.value}
+              checked={mode === option.value}
+              onChange={() => onModeChange(option.value)}
+            />
+            <span className="persistence-options__control" />
+            <span>
+              <strong>{option.label}</strong>
+              <small>{option.detail}</small>
+            </span>
+          </label>
+        ))}
+      </div>
+
+      {storesAudio ? (
+        <div className="consent-panel">
+          <label className="consent-check">
+            <input
+              type="checkbox"
+              checked={acknowledged}
+              onChange={(event) => onAcknowledgedChange(event.target.checked)}
+            />
+            <span>
+              I confirm caller consent or another approved basis for retaining this audio.
+            </span>
+          </label>
+          <label htmlFor="consent-reference">
+            Consent reference <span>Required</span>
+          </label>
+          <input
+            id="consent-reference"
+            type="text"
+            value={consentReference}
+            onChange={(event) => onConsentReferenceChange(event.target.value)}
+            placeholder="Approval, ticket, or policy reference"
+            autoComplete="off"
+            maxLength="160"
+          />
+          <small>Use an opaque internal reference—never a name, phone number, or transcript.</small>
+          {!ready ? <p role="status">A confirmation and reference are required before audio can be sent for storage.</p> : null}
+        </div>
+      ) : null}
     </fieldset>
   );
 }
@@ -441,7 +968,7 @@ function LiveSurface({ phase, stats }) {
   );
 }
 
-function LiveWaitingPanel({ phase, stats }) {
+function LiveWaitingPanel({ persistenceMode, phase, stats, storage }) {
   const waiting = phase === "finalizing" ? "Final inference in progress" : "Waiting for the first estimate";
   return (
     <aside className="empty-results empty-results--live" aria-label="Live stream progress">
@@ -457,13 +984,21 @@ function LiveWaitingPanel({ phase, stats }) {
         <div><dt>Captured</dt><dd>{formatCaptureTime(stats.elapsed || 0)}</dd></div>
         <div><dt>PCM chunks</dt><dd>{stats.chunks || 0}</dd></div>
       </dl>
-      <div className="privacy-card">
-        <LockIcon />
-        <div>
-          <strong>No reconnect and replay</strong>
-          <p>A failed stream restarts manually, so caller audio is never retained for automatic replay.</p>
+      {storage ? (
+        <PersistenceSummary
+          requestedMode={persistenceMode}
+          result={storage}
+          streamStats={stats}
+        />
+      ) : (
+        <div className="privacy-card">
+          <LockIcon />
+          <div>
+            <strong>No automatic replay</strong>
+            <p>A failed stream restarts manually. Server retention follows only the explicit storage choice for this session.</p>
+          </div>
         </div>
-      </div>
+      )}
     </aside>
   );
 }
@@ -472,6 +1007,17 @@ function App() {
   const [sourceMode, setSourceMode] = useState("upload");
   const [file, setFile] = useState(null);
   const [contactId, setContactId] = useState("");
+  const [persistenceMode, setPersistenceMode] = useState(PERSISTENCE_MODES.NONE);
+  const [persistenceCapabilities, setPersistenceCapabilities] = useState({
+    enabled: false,
+    maximum_mode: PERSISTENCE_MODES.NONE,
+    default_mode: PERSISTENCE_MODES.NONE,
+  });
+  const [capabilitiesPhase, setCapabilitiesPhase] = useState("loading");
+  const [consentAcknowledged, setConsentAcknowledged] = useState(false);
+  const [consentReference, setConsentReference] = useState("");
+  const [activePersistenceMode, setActivePersistenceMode] = useState(PERSISTENCE_MODES.NONE);
+  const [historyRevision, setHistoryRevision] = useState(0);
   const [result, setResult] = useState(null);
   const [error, setError] = useState(null);
   const [isDragging, setIsDragging] = useState(false);
@@ -479,6 +1025,7 @@ function App() {
   const [recordPhase, setRecordPhaseState] = useState("idle");
   const [recordElapsed, setRecordElapsed] = useState(0);
   const [livePhase, setLivePhase] = useState("idle");
+  const [liveStorage, setLiveStorage] = useState(null);
   const [liveStats, setLiveStats] = useState({
     bytes: 0,
     chunks: 0,
@@ -499,6 +1046,10 @@ function App() {
   const recordingBusy = ["requesting", "recording", "stopping"].includes(recordPhase);
   const liveBusy = ["requesting", "connecting", "streaming", "finalizing"].includes(livePhase);
   const sourceLocked = isAnalyzing || recordingBusy || liveBusy;
+  const maximumPersistenceMode = persistenceCapabilities.maximum_mode;
+  const persistenceReady =
+    persistenceMode !== PERSISTENCE_MODES.RESULT_AND_AUDIO ||
+    (consentAcknowledged && Boolean(consentReference.trim()));
 
   useEffect(() => {
     if (result && (result.type !== "prediction" || result.is_final)) {
@@ -509,6 +1060,26 @@ function App() {
   useEffect(() => {
     if (error) errorHeadingRef.current?.focus();
   }, [error]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    getPersistenceCapabilities({ signal: controller.signal })
+      .then((capabilities) => {
+        if (controller.signal.aborted) return;
+        setPersistenceCapabilities(capabilities);
+        setCapabilitiesPhase("ready");
+      })
+      .catch((capabilitiesError) => {
+        if (capabilitiesError?.name === "AbortError" || controller.signal.aborted) return;
+        setPersistenceCapabilities({
+          enabled: false,
+          maximum_mode: PERSISTENCE_MODES.NONE,
+          default_mode: PERSISTENCE_MODES.NONE,
+        });
+        setCapabilitiesPhase("error");
+      });
+    return () => controller.abort();
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -572,10 +1143,25 @@ function App() {
     liveSessionRef.current = null;
     clearFile();
     setContactId("");
+    setPersistenceMode(PERSISTENCE_MODES.NONE);
+    setConsentAcknowledged(false);
+    setConsentReference("");
+    setActivePersistenceMode(PERSISTENCE_MODES.NONE);
     setRecordPhase("idle");
     setRecordElapsed(0);
     setLivePhase("idle");
+    setLiveStorage(null);
     setLiveStats({ bytes: 0, chunks: 0, elapsed: 0, level: 0, sampleRate: 0 });
+  }
+
+  function changePersistenceMode(nextMode) {
+    if (!persistenceModeIsAvailable(nextMode, maximumPersistenceMode)) return;
+    setPersistenceMode(nextMode);
+    setError(null);
+    if (nextMode !== PERSISTENCE_MODES.RESULT_AND_AUDIO) {
+      setConsentAcknowledged(false);
+      setConsentReference("");
+    }
   }
 
   function changeSourceMode(nextMode) {
@@ -592,6 +1178,7 @@ function App() {
     setRecordPhase("idle");
     setRecordElapsed(0);
     setLivePhase("idle");
+    setLiveStorage(null);
     setLiveStats({ bytes: 0, chunks: 0, elapsed: 0, level: 0, sampleRate: 0 });
     setSourceMode(nextMode);
     if (fileInputRef.current) fileInputRef.current.value = "";
@@ -607,6 +1194,13 @@ function App() {
 
   async function handleSubmit(event) {
     event.preventDefault();
+    if (!persistenceReady) {
+      setError({
+        code: "PERSISTENCE_CONSENT_REQUIRED",
+        message: "Confirm the approved audio-retention basis and provide its opaque reference.",
+      });
+      return;
+    }
     if (sourceMode === "live") {
       await startLiveAnalysis();
       return;
@@ -620,16 +1214,23 @@ function App() {
     const controller = new AbortController();
     requestControllerRef.current = controller;
     setIsAnalyzing(true);
+    setActivePersistenceMode(persistenceMode);
     setResult(null);
     setError(null);
+    setLiveStorage(null);
 
     try {
       const response = await analyzeAudio({
         file,
         contactId,
+        persistenceMode,
+        consentReference,
         signal: controller.signal,
       });
       setResult(response);
+      if (persistenceMode !== PERSISTENCE_MODES.NONE) {
+        setHistoryRevision((value) => value + 1);
+      }
     } catch (requestError) {
       if (requestError?.name !== "AbortError") {
         const normalized =
@@ -666,6 +1267,7 @@ function App() {
     setFile(null);
     setResult(null);
     setError(null);
+    setLiveStorage(null);
     setRecordElapsed(0);
     setRecordPhase("requesting");
     const recorder = new BrowserRecorder({
@@ -739,6 +1341,13 @@ function App() {
 
   async function startLiveAnalysis() {
     if (liveSessionRef.current || liveBusy) return;
+    if (!persistenceReady) {
+      setError({
+        code: "PERSISTENCE_CONSENT_REQUIRED",
+        message: "Confirm the approved audio-retention basis and provide its opaque reference.",
+      });
+      return;
+    }
     if (contactId.trim() && !UUID_PATTERN.test(contactId.trim())) {
       setError({
         code: "INVALID_CONTACT_ID",
@@ -755,9 +1364,12 @@ function App() {
     }
     setResult(null);
     setError(null);
+    setLiveStorage(null);
+    setActivePersistenceMode(persistenceMode);
     setLiveStats({ bytes: 0, chunks: 0, elapsed: 0, level: 0, sampleRate: 0 });
 
     const session = new LiveAnalysisSession({
+      consentReference,
       onError: (streamError) => {
         if (liveSessionRef.current !== session) return;
         setError({
@@ -771,6 +1383,9 @@ function App() {
       onPrediction: (prediction) => {
         if (liveSessionRef.current !== session) return;
         setResult(prediction);
+        if (prediction.is_final && persistenceMode !== PERSISTENCE_MODES.NONE) {
+          setHistoryRevision((value) => value + 1);
+        }
       },
       onState: (nextState) => {
         if (liveSessionRef.current !== session) return;
@@ -782,6 +1397,10 @@ function App() {
       onStats: (stats) => {
         if (liveSessionRef.current === session) setLiveStats(stats);
       },
+      onStorage: (storage) => {
+        if (liveSessionRef.current === session) setLiveStorage(storage);
+      },
+      persistenceMode,
     });
     liveSessionRef.current = session;
     try {
@@ -801,6 +1420,7 @@ function App() {
     liveSessionRef.current = null;
     setResult(null);
     setError(null);
+    setLiveStorage(null);
     setLivePhase("idle");
     setLiveStats({ bytes: 0, chunks: 0, elapsed: 0, level: 0, sampleRate: 0 });
     void session.cancel();
@@ -818,7 +1438,7 @@ function App() {
       );
     }
     if (sourceMode === "upload") {
-      return <button className="primary-button" type="submit" disabled={!file}>Analyze audio</button>;
+      return <button className="primary-button" type="submit" disabled={!file || !persistenceReady}>Analyze audio</button>;
     }
     if (sourceMode === "record") {
       if (recordPhase === "recording") {
@@ -844,7 +1464,7 @@ function App() {
       if (file) {
         return (
           <>
-            <button className="primary-button" type="submit">Analyze recording</button>
+            <button className="primary-button" type="submit" disabled={!persistenceReady}>Analyze recording</button>
             <button className="text-button" type="button" onClick={cancelRecording}>Record again</button>
           </>
         );
@@ -873,7 +1493,7 @@ function App() {
     }
     if (livePhase === "complete") return null;
     return (
-      <button className="primary-button" type="button" onClick={startLiveAnalysis}>
+      <button className="primary-button" type="button" onClick={startLiveAnalysis} disabled={!persistenceReady}>
         {livePhase === "error" ? "Retry live analysis" : "Start live analysis"}
       </button>
     );
@@ -1009,6 +1629,18 @@ function App() {
                 <small>Use an opaque UUID only—never a name or phone number.</small>
               </div>
 
+              <PersistenceControls
+                acknowledged={consentAcknowledged}
+                capabilitiesPhase={capabilitiesPhase}
+                consentReference={consentReference}
+                disabled={sourceLocked}
+                maximumMode={maximumPersistenceMode}
+                mode={persistenceMode}
+                onAcknowledgedChange={setConsentAcknowledged}
+                onConsentReferenceChange={setConsentReference}
+                onModeChange={changePersistenceMode}
+              />
+
               {error ? (
                 <div className="error-alert" role="alert">
                   <div>
@@ -1034,15 +1666,23 @@ function App() {
                 result={result}
                 headingRef={resultsHeadingRef}
                 onReset={startNewAnalysis}
+                persistenceMode={activePersistenceMode}
+                storage={liveStorage}
                 streamStats={liveStats}
               />
             ) : sourceMode === "live" && liveHasActivity ? (
-              <LiveWaitingPanel phase={livePhase} stats={liveStats} />
+              <LiveWaitingPanel
+                persistenceMode={activePersistenceMode}
+                phase={livePhase}
+                stats={liveStats}
+                storage={liveStorage}
+              />
             ) : (
               <EmptyResults />
             )}
           </div>
         </div>
+        <StoredAnalysisHistory refreshToken={historyRevision} />
         {result?.type === "prediction" && !result.is_final ? (
           <p className="sr-only" role="status">Live estimate updated, sequence {result.sequence}.</p>
         ) : null}
@@ -1050,7 +1690,7 @@ function App() {
 
       <footer>
         <span>Diaflow Voice Analyzer</span>
-        <p>Audio remains request-scoped and is not stored by the application.</p>
+        <p>Audio remains request-scoped unless retention is explicitly selected with consent.</p>
       </footer>
     </div>
   );

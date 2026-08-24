@@ -39,24 +39,50 @@ def synthetic_wav(duration: float = 3.0, sample_rate: int = 16_000) -> bytes:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:8000")
+    parser.add_argument(
+        "--persistence-mode",
+        choices=("none", "result", "result_and_audio"),
+        default="none",
+    )
+    parser.add_argument(
+        "--consent-reference",
+        default="synthetic-smoke-test",
+        help="Opaque demo reference used only for result_and_audio",
+    )
     args = parser.parse_args()
+    headers = {
+        "Content-Type": "audio/wav",
+        "X-Persistence-Mode": args.persistence_mode,
+    }
+    if args.persistence_mode == "result_and_audio":
+        headers["X-Consent-Reference"] = args.consent_reference
     request = urllib.request.Request(
         f"{args.url.rstrip('/')}/analyze",
         data=synthetic_wav(),
-        headers={"Content-Type": "audio/wav"},
+        headers=headers,
         method="POST",
     )
     with urllib.request.urlopen(request, timeout=15) as response:
         payload = json.loads(response.read())
     print(json.dumps(payload, indent=2))
-    if set(payload) != {
+    required = {
         "contact_id",
         "gender",
         "age_bracket",
         "processing_ms",
         "audio_quality",
-    }:
+    }
+    if not required.issubset(payload):
         raise SystemExit("response did not match the expected contract")
+    if args.persistence_mode == "none" and (
+        {"analysis_id", "persistence"} & payload.keys()
+    ):
+        raise SystemExit("the default no-retention response exposed a storage receipt")
+    if args.persistence_mode != "none" and not {
+        "analysis_id",
+        "persistence",
+    }.issubset(payload):
+        raise SystemExit("retained analysis did not return a storage receipt")
 
 
 if __name__ == "__main__":

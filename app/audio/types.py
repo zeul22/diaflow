@@ -26,6 +26,17 @@ CONTENT_TYPE_ENCODINGS = {
     "audio/alaw": "alaw",
 }
 
+NARROWBAND_ENCODINGS = {
+    "alaw",
+    "amr_nb",
+    "g723_1",
+    "gsm",
+    "gsm_ms",
+    "mulaw",
+    "pcm_alaw",
+    "pcm_mulaw",
+}
+
 
 @dataclass(frozen=True, slots=True)
 class SourceSpec:
@@ -37,7 +48,7 @@ class SourceSpec:
 
     @property
     def is_narrowband(self) -> bool:
-        return self.sample_rate <= 8_000 or self.encoding in {"mulaw", "alaw"}
+        return self.sample_rate <= 8_000 or self.encoding in NARROWBAND_ENCODINGS
 
     @property
     def is_quality_limited(self) -> bool:
