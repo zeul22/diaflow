@@ -61,6 +61,8 @@ Structured logs contain UTC timestamp, severity, event, request ID, method, boun
 
 Prometheus metrics use bounded labels for path, status, backend, quality, and stable error code. They contain no per-caller identifier. Unexpected exception logs include a stack trace; application exceptions do not include payload content, but dependency messages should still be reviewed for leakage.
 
+The supplied frontend proxy disables Nginx access logging for `/api/analyze` and the WebSocket endpoint. Its remaining access logs record the normalized path only, not the query string. This prevents uploaded filenames, contact IDs, and analysis payloads from being written by the proxy's default request log. Container-platform log collection still needs access control and an appropriate retention policy.
+
 Configure ingress, WAF, service mesh, APM, tracing, and support tooling to exclude request/response bodies, query strings, `X-Contact-ID`, WebSocket frames, and multipart content. Protect logs and metrics with access control and short, justified retention.
 
 ## Network and storage boundary

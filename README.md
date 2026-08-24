@@ -8,6 +8,7 @@ A request-scoped FastAPI service that estimates an adult caller's perceived bina
 
 - `POST /analyze` for raw HTTP bodies and streaming-parsed multipart uploads.
 - `WS /ws/analyze` for progressive predictions over raw PCM, μ-law, or A-law chunks.
+- A responsive React/Vite/SCSS web client for drag-and-drop upload, preview, results, and actionable error states.
 - Native WAV/PCM/G.711 decoding plus FFmpeg fallback for common compressed containers and codecs.
 - Quality gating for short, quiet, non-speech, noisy, clipped, low-frequency-heavy, and narrowband input.
 - One pinned SpeechBrain ECAPA-TDNN encoder pass shared by Apache-2.0 griko SVM/SVR attribute heads.
@@ -35,6 +36,8 @@ curl -fsS http://localhost:8000/readyz
 
 Both should return HTTP 200. Interactive OpenAPI documentation is available at `http://localhost:8000/docs`.
 
+Open the web interface at [http://localhost:3000](http://localhost:3000). Select or drag in an M4A, WAV, MP3, OGG, FLAC, or WebM recording; the browser sends it directly to the service without storing it. Compressed recordings such as M4A are accepted through the backend's FFmpeg decoder and may be conservatively marked `degraded`.
+
 Run a dependency-free synthetic contract smoke test from another terminal:
 
 ```bash
@@ -46,6 +49,12 @@ streaming as well:
 
 ```bash
 make smoke-ws
+```
+
+Verify the same REST contract through the frontend reverse proxy:
+
+```bash
+make smoke-ui
 ```
 
 Prepare a 2–5 second, single-speaker test file by following [samples/README.md](samples/README.md), then submit it as a raw WAV body:
@@ -94,6 +103,20 @@ curl -sS -X POST \
 ```
 
 μ-law, A-law, and other 8 kHz sources are deliberately marked at least `degraded`; the service still predicts when there is enough speech but discounts confidence.
+
+## Frontend development
+
+The production frontend is built into a small Nginx container and proxies only the analyzer, readiness, and WebSocket paths to FastAPI. Browser requests remain same-origin, so the backend does not need permissive CORS settings. The backend port and UI port are bound to loopback by default.
+
+For Vite hot reload, keep the backend running and start the development server in another terminal:
+
+```bash
+cd frontend
+npm ci
+npm run dev
+```
+
+Then open `http://localhost:5173`. Vite proxies `/api` to `http://127.0.0.1:8000`. The client keeps the selected file and result only in React memory: it does not use local storage, analytics, a service worker, or filename logging.
 
 ## Model and decision rationale
 
@@ -156,6 +179,16 @@ make test
 ```
 
 It covers raw and multipart REST requests, insufficient audio, structured errors, health/metrics, progressive WebSocket results, audio decoding, quality gating, kernel-head conversion behavior, and confidence postprocessing.
+
+Frontend checks use Vitest, React Testing Library, ESLint, and a production Vite build:
+
+```bash
+make frontend-test
+make frontend-lint
+make frontend-build
+```
+
+Run every backend and frontend quality gate with `make check`.
 
 ## Common Voice evaluation harness
 

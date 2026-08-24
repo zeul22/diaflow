@@ -10,3 +10,16 @@ coverage.xml
 htmlcov
 docs
 samples
+frontend/node_modules
+frontend/dist
+
+# Never send local caller recordings into a Docker build context.
+*.aac
+*.flac
+*.m4a
+*.mp3
+*.ogg
+*.opus
+*.pcm
+*.wav
+*.webm

@@ -10,3 +10,16 @@ __pycache__/
 coverage.xml
 htmlcov/
 models/
+frontend/node_modules/
+frontend/dist/
+
+# Caller audio is PII and must stay local.
+*.aac
+*.flac
+*.m4a
+*.mp3
+*.ogg
+*.opus
+*.pcm
+*.wav
+*.webm

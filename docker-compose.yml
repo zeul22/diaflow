@@ -7,7 +7,7 @@ services:
     image: voice-contact-attributes:local
     init: true
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       LOG_LEVEL: INFO
       INFERENCE_CONCURRENCY: "1"
@@ -25,3 +25,24 @@ services:
     security_opt:
       - no-new-privileges:true
     stop_grace_period: 10s
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: runtime
+    image: voice-contact-attributes-ui:local
+    init: true
+    depends_on:
+      voice-attributes:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:3000:8080"
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 5s
