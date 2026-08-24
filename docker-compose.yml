@@ -1,0 +1,27 @@
+services:
+  voice-attributes:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: voice-contact-attributes:local
+    init: true
+    ports:
+      - "8000:8000"
+    environment:
+      LOG_LEVEL: INFO
+      INFERENCE_CONCURRENCY: "1"
+      QUEUE_TIMEOUT_SECONDS: "1.0"
+      MAX_AUDIO_SECONDS: "30"
+      MAX_UPLOAD_BYTES: "12582912"
+      REQUEST_IDLE_TIMEOUT_SECONDS: "10"
+      WS_IDLE_TIMEOUT_SECONDS: "30"
+      WS_MAX_SESSION_SECONDS: "120"
+    read_only: true
+    tmpfs:
+      - /tmp:size=384m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 10s
