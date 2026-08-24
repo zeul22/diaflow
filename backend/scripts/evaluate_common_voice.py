@@ -2,7 +2,7 @@
 """Evaluate a running service against an extracted Common Voice release.
 
 Example:
-  python scripts/evaluate_common_voice.py \
+  python3 backend/scripts/evaluate_common_voice.py \
     --tsv /data/cv-corpus/en/test.tsv --clips /data/cv-corpus/en/clips --limit 500
 """
 

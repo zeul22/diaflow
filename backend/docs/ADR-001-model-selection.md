@@ -31,7 +31,7 @@ Use a single SpeechBrain ECAPA-TDNN encoder and two shallow griko heads:
 | [`griko/gender_cls_svm_ecapa_voxceleb`](https://huggingface.co/griko/gender_cls_svm_ecapa_voxceleb/tree/25f3e5a3c1c172dceeb723d8061e3e80ba6c8d64) | `25f3e5a3c1c172dceeb723d8061e3e80ba6c8d64` | Apache-2.0 | Binary SVM probabilities for the upstream `female`/`male` labels. |
 | [`griko/age_reg_svr_ecapa_voxceleb2`](https://huggingface.co/griko/age_reg_svr_ecapa_voxceleb2/tree/1d2356ac55f51fbd3f327f1b9260860decb21233) | `1d2356ac55f51fbd3f327f1b9260860decb21233` | Apache-2.0 | Continuous age estimate from an SVR. |
 
-Every downloaded file also has an expected SHA-256 in `scripts/prepare_models.py`. The generated image records sources, revisions, hashes, and conversion facts in `/opt/models/model-metadata.json`. Runtime model loading is offline.
+Every downloaded file also has an expected SHA-256 in `backend/scripts/prepare_models.py`. The generated image records sources, revisions, hashes, and conversion facts in `/opt/models/model-metadata.json`. Runtime model loading is offline.
 
 The same embedding feeds both heads, avoiding a second neural backbone. The upstream gender card reports 98.9% VoxCeleb2, 92.3% Common Voice v10 English, and 99.6% TIMIT accuracy. The age card reports 7.89-year VoxCeleb2 test MAE. Those are upstream results, not this service's logistics-domain performance, and they must not be presented as production validation.
 

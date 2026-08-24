@@ -12,7 +12,7 @@ RUN pip install \
     "pandas==2.2.3" \
     "scikit-learn==1.5.2"
 
-COPY scripts/prepare_models.py /usr/local/bin/prepare_models.py
+COPY backend/scripts/prepare_models.py /usr/local/bin/prepare_models.py
 RUN python /usr/local/bin/prepare_models.py --output /opt/models
 
 
@@ -41,7 +41,7 @@ RUN apt-get update \
 
 WORKDIR /srv/app
 
-COPY pyproject.toml README.md ./
+COPY backend/pyproject.toml backend/README.md ./
 
 # Pin CPU wheels so x86 images do not pull CUDA libraries. The extra remains
 # architecture-portable on Docker's supported Linux targets. Installing the
@@ -52,8 +52,8 @@ RUN pip install --index-url https://download.pytorch.org/whl/cpu \
     && pip install ".[model,wavlm]"
 
 COPY LICENSE /licenses/service-MIT.txt
-COPY THIRD_PARTY_NOTICES.md /licenses/THIRD_PARTY_NOTICES.md
-COPY app ./app
+COPY backend/THIRD_PARTY_NOTICES.md /licenses/THIRD_PARTY_NOTICES.md
+COPY backend/app ./app
 RUN pip install --force-reinstall --no-deps .
 
 COPY --from=model-builder /opt/models /opt/models
@@ -71,8 +71,8 @@ CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--worker
 FROM runtime AS test
 
 USER root
-COPY tests ./tests
-COPY scripts ./scripts
+COPY backend/tests ./tests
+COPY backend/scripts ./scripts
 RUN pip install ".[dev]"
 ENV RUFF_CACHE_DIR=/tmp/ruff-cache \
     PYTEST_ADDOPTS="-q -p no:cacheprovider"

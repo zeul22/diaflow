@@ -5,4 +5,4 @@ services:
       WAVLM_MODEL_PATH: /opt/models/wavlm/model.onnx
       WAVLM_MODEL_REVISION: ${WAVLM_MODEL_REVISION:-local-owned}
     volumes:
-      - ./models/wavlm:/opt/models/wavlm:ro
+      - ./backend/models/wavlm:/opt/models/wavlm:ro

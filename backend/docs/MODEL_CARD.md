@@ -19,7 +19,7 @@ This is the Compose-default baseline and rollback path, not the final production
 | [`griko/gender_cls_svm_ecapa_voxceleb`](https://huggingface.co/griko/gender_cls_svm_ecapa_voxceleb/tree/25f3e5a3c1c172dceeb723d8061e3e80ba6c8d64) | `25f3e5a3c1c172dceeb723d8061e3e80ba6c8d64` | Apache-2.0 |
 | [`griko/age_reg_svr_ecapa_voxceleb2`](https://huggingface.co/griko/age_reg_svr_ecapa_voxceleb2/tree/1d2356ac55f51fbd3f327f1b9260860decb21233) | `1d2356ac55f51fbd3f327f1b9260860decb21233` | Apache-2.0 |
 
-Exact file SHA-256 values are maintained in `scripts/prepare_models.py` and copied into `/opt/models/model-metadata.json` in the image. See [ADR-001](ADR-001-model-selection.md) for license comparison and serialization controls. Model licenses do not resolve dataset, privacy, publicity, biometric, or voice-rights obligations.
+Exact file SHA-256 values are maintained in `backend/scripts/prepare_models.py` and copied into `/opt/models/model-metadata.json` in the image. See [ADR-001](ADR-001-model-selection.md) for license comparison and serialization controls. Model licenses do not resolve dataset, privacy, publicity, biometric, or voice-rights obligations.
 
 ## Intended use
 
@@ -111,7 +111,7 @@ Monitor aggregate quality distribution, unknown coverage, confidence histograms,
 - No measured hardware-specific proof of the under-500 ms target.
 - No language/accent field.
 - No diarization or caller-channel verification.
-- No ONNX, quantization, GPU batching, or incremental streaming embeddings.
+- No bundled approved production WavLM ONNX artifact, quantization, GPU batching, or incremental streaming embeddings.
 - No built-in authentication, TLS, rate limiting, or tenant isolation.
 
 ## Change policy

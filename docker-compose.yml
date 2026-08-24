@@ -36,7 +36,7 @@ services:
   voice-attributes:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: backend/Dockerfile
       target: runtime
     image: voice-contact-attributes:local
     init: true

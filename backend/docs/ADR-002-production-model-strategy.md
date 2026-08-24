@@ -40,7 +40,7 @@ Reported numbers use different datasets and splits and are not directly comparab
 
 The graph must contain the pinned WavLM encoder, our two heads, and the approved calibration. Direct age-bracket probabilities bypass the baseline's made-up residual confidence. The artifact revision is included in the model name used for metrics and stored analysis metadata.
 
-The shipped runtime includes ONNX Runtime. Put the approved artifact at `models/wavlm/model.onnx`, set a traceable `WAVLM_MODEL_REVISION`, and start `docker-compose.yml` with the supplied `docker-compose.wavlm.yml` override. The graph is mounted read-only; missing or incompatible artifacts fail startup instead of falling back to the baseline.
+The shipped runtime includes ONNX Runtime. Put the approved artifact at `backend/models/wavlm/model.onnx`, set a traceable `WAVLM_MODEL_REVISION`, and start `docker-compose.yml` with the supplied `docker-compose.wavlm.yml` override. The graph is mounted read-only; missing or incompatible artifacts fail startup instead of falling back to the baseline.
 
 ## Promotion gates
 

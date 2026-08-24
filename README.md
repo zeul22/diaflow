@@ -4,6 +4,8 @@ A FastAPI service that estimates an adult caller's perceived binary voice presen
 
 > The API field is named `gender` to satisfy the required contract. It is a binary acoustic estimate of how a voice presents to the training labels, not a determination of gender identity, sex, pronouns, or legal status. Do not use it for consequential, discriminatory, eligibility, pricing, employment, insurance, medical, or legal decisions.
 
+[Setup](#quick-start) · [Design decisions](backend/docs/DESIGN.md) · [Model rationale](backend/docs/ADR-002-production-model-strategy.md) · [Known limitations](#known-limitations)
+
 ## What is implemented
 
 - `POST /analyze` for raw HTTP bodies and streaming-parsed multipart uploads.
@@ -20,6 +22,22 @@ A FastAPI service that estimates an adult caller's perceived binary voice presen
 - A multi-stage, non-root, read-only Docker image. Model weights are downloaded only while building the image.
 
 Language/accent detection is not implemented in this version. A Common Voice evaluation harness is included for accuracy, coverage, confusion, and calibration checks.
+
+## Repository layout
+
+```text
+.
+├── backend/                  # FastAPI, models, persistence, tests, scripts, docs
+├── frontend/                 # React, Vite, SCSS, Nginx proxy, UI tests
+├── docker-compose.yml        # Complete local stack, run from this directory
+├── docker-compose.wavlm.yml  # Owned WavLM deployment override
+├── Makefile                  # Root-only development and verification commands
+└── README.md                 # Project entry point
+```
+
+Run Docker Compose, Make, smoke, test, and development commands from the
+repository root. The component READMEs are [backend/README.md](backend/README.md)
+and [frontend/README.md](frontend/README.md).
 
 ## Quick start
 
@@ -42,7 +60,7 @@ Open the web interface at [http://localhost:3000](http://localhost:3000). Select
 
 The local object-store console is [http://localhost:9001](http://localhost:9001) (`voice-local` / `voice-local-development-only`). It is a development visualization only; use managed S3 with IAM/KMS in production. PostgreSQL stays private to the Compose network; inspect it with `docker compose exec postgres psql -U voice_attributes -d voice_attributes`.
 
-The **Record** mode captures a complete browser-supported clip and analyzes it through REST. **Live** uses an AudioWorklet to send raw microphone PCM in roughly 250 ms WebSocket frames and replaces provisional estimates until the final result arrives. Microphone access works over localhost for development and requires HTTPS/WSS when deployed. See [docs/STREAMING.md](docs/STREAMING.md) for the browser and real call-media designs.
+The **Record** mode captures a complete browser-supported clip and analyzes it through REST. **Live** uses an AudioWorklet to send raw microphone PCM in roughly 250 ms WebSocket frames and replaces provisional estimates until the final result arrives. Microphone access works over localhost for development and requires HTTPS/WSS when deployed. See [backend/docs/STREAMING.md](backend/docs/STREAMING.md) for the browser and real call-media designs.
 
 Run a dependency-free synthetic contract smoke test from another terminal:
 
@@ -68,21 +86,21 @@ Verify the same REST contract through the frontend reverse proxy:
 make smoke-ui
 ```
 
-Prepare a 2–5 second, single-speaker test file by following [samples/README.md](samples/README.md), then submit it as a raw WAV body:
+Prepare a 2–5 second, single-speaker test file by following [backend/samples/README.md](backend/samples/README.md), then submit it as a raw WAV body:
 
 ```bash
 curl -sS -X POST \
   'http://localhost:8000/analyze?contact_id=123e4567-e89b-12d3-a456-426614174000' \
   -H 'Content-Type: audio/wav' \
   -H 'X-Request-ID: smoke-001' \
-  --data-binary @samples/caller.wav
+  --data-binary @backend/samples/caller.wav
 ```
 
 Or use multipart form data:
 
 ```bash
 curl -sS -X POST http://localhost:8000/analyze \
-  -F 'audio=@samples/caller.wav;type=audio/wav' \
+  -F 'audio=@backend/samples/caller.wav;type=audio/wav' \
   -F 'contact_id=123e4567-e89b-12d3-a456-426614174000'
 ```
 
@@ -91,7 +109,7 @@ To retain the structured result but not audio:
 ```bash
 curl -sS -X POST http://localhost:8000/analyze \
   -H 'X-Persistence-Mode: result' \
-  -F 'audio=@samples/caller.wav;type=audio/wav'
+  -F 'audio=@backend/samples/caller.wav;type=audio/wav'
 ```
 
 To demonstrate consent-gated audio retention:
@@ -100,7 +118,7 @@ To demonstrate consent-gated audio retention:
 curl -sS -X POST http://localhost:8000/analyze \
   -H 'X-Persistence-Mode: result_and_audio' \
   -H 'X-Consent-Reference: demo-approval-001' \
-  -F 'audio=@samples/caller.wav;type=audio/wav'
+  -F 'audio=@backend/samples/caller.wav;type=audio/wav'
 ```
 
 The retained response includes `analysis_id` and a `persistence` receipt. Inspect its object segments and logical chunk offsets with `GET /analyses/{analysis_id}`, list retained analyses with `GET /analyses`, or erase both objects and metadata with `DELETE /analyses/{analysis_id}`. The consent reference itself is never stored; only its SHA-256 is recorded.
@@ -117,7 +135,7 @@ A successful response has this shape:
 }
 ```
 
-Predictions and numbers above are illustrative. See [docs/API.md](docs/API.md) for raw telephony formats, response semantics, error codes, and a working WebSocket client.
+Predictions and numbers above are illustrative. See [backend/docs/API.md](backend/docs/API.md) for raw telephony formats, response semantics, error codes, and a working WebSocket client.
 
 ## Telephony integration
 
@@ -129,7 +147,7 @@ For an 8 kHz μ-law telephony body:
 curl -sS -X POST \
   'http://localhost:8000/analyze?encoding=mulaw&sample_rate=8000&channels=1' \
   -H 'Content-Type: application/octet-stream' \
-  --data-binary @samples/caller.mulaw
+  --data-binary @backend/samples/caller.mulaw
 ```
 
 μ-law, A-law, and other 8 kHz sources are deliberately marked at least `degraded`; the service still predicts when there is enough speech but discounts confidence.
@@ -138,12 +156,11 @@ curl -sS -X POST \
 
 The production frontend is built into a small Nginx container and proxies the analyzer, readiness, WebSocket, persistence-capability, and retained-analysis paths to FastAPI. Browser requests remain same-origin, so the backend does not need permissive CORS settings. Its permissions policy allows microphone access only to the same origin. The backend port and UI port are bound to loopback by default.
 
-For Vite hot reload, keep the backend running and start the development server in another terminal:
+For Vite hot reload, keep the backend running and use the root Make targets in another terminal:
 
 ```bash
-cd frontend
-npm ci
-npm run dev
+make frontend-install
+make frontend-dev
 ```
 
 Then open `http://localhost:5173`. Vite proxies `/api` to `http://127.0.0.1:8000`. The client keeps the selected file and result only in React memory: it does not use browser local storage, analytics, a service worker, or filename logging. Server-side retention occurs only when the visible per-request control is changed from `None`.
@@ -152,9 +169,9 @@ Then open `http://localhost:5173`. Vite proxies `/api` to `http://127.0.0.1:8000
 
 The selected pipeline runs the pinned `speechbrain/spkrec-ecapa-voxceleb` encoder once and applies the pinned `griko/gender_cls_svm_ecapa_voxceleb` and `griko/age_reg_svr_ecapa_voxceleb2` heads to the same 192-dimensional embedding. Model repositories declare Apache-2.0, which permits commercial use subject to its conditions. The service repository is MIT licensed. Model and dataset licenses are separate, and neither grants privacy, publicity, voice, or training-data rights; production adoption still requires legal review and preservation of required notices.
 
-The runnable ECAPA stack is a baseline, not a claim that it is universally best. The current production target is an owned WavLM Base+ backbone with logistics-trained, calibrated joint heads, exported through the included `wavlm_onnx` adapter. Because those heads must be trained and evaluated rather than downloaded, Compose keeps ECAPA as the working default. audEERING devAIce is the best turnkey paid evaluation; its public weights cannot be used commercially. The ranked evidence and promotion gates are in [ADR-002](docs/ADR-002-production-model-strategy.md); the original baseline record remains in [ADR-001](docs/ADR-001-model-selection.md).
+The runnable ECAPA stack is a baseline, not a claim that it is universally best. The current production target is an owned WavLM Base+ backbone with logistics-trained, calibrated joint heads, exported through the included `wavlm_onnx` adapter. Because those heads must be trained and evaluated rather than downloaded, Compose keeps ECAPA as the working default. audEERING devAIce is the best turnkey paid evaluation; its public weights cannot be used commercially. The ranked evidence and promotion gates are in [ADR-002](backend/docs/ADR-002-production-model-strategy.md); the original baseline record remains in [ADR-001](backend/docs/ADR-001-model-selection.md).
 
-The Docker runtime includes ONNX Runtime, but it intentionally does not pretend that bare public WavLM backbone weights are a deployable demographic model. After training and exporting the owned graph described in ADR-002, place it at `models/wavlm/model.onnx` and launch the supplied override:
+The Docker runtime includes ONNX Runtime, but it intentionally does not pretend that bare public WavLM backbone weights are a deployable demographic model. After training and exporting the owned graph described in ADR-002, place it at `backend/models/wavlm/model.onnx` and launch the supplied override:
 
 ```bash
 WAVLM_MODEL_REVISION=logistics-v1 \
@@ -218,7 +235,7 @@ Invalid configuration fails startup. Keep the default one Uvicorn worker per con
 
 The under-500 ms requirement is a deployment acceptance target, not a universal guarantee. Benchmark p50/p95 end-to-end latency on the intended CPU architecture and codec mix after model warmup. Compressed decoding, noisy clips, host contention, and progressive re-analysis change latency.
 
-For 1,000 concurrent calls, use stateless regional API pods for ingestion and a separate GPU inference pool with dynamic micro-batching, deadline-aware queues, bounded per-call buffers, admission control, and autoscaling on queue depth, GPU utilization, and p95 latency. See [DESIGN.md](docs/DESIGN.md).
+For 1,000 concurrent calls, use stateless regional API pods for ingestion and a separate GPU inference pool with dynamic micro-batching, deadline-aware queues, bounded per-call buffers, admission control, and autoscaling on queue depth, GPU utilization, and p95 latency. See [DESIGN.md](backend/docs/DESIGN.md).
 
 ## Tests
 
@@ -245,7 +262,7 @@ Run every backend and frontend quality gate with `make check`.
 Download and extract a [Mozilla Common Voice](https://commonvoice.mozilla.org/en/datasets) release after reviewing its terms. With the service running, point the harness at a metadata TSV and its `clips` directory:
 
 ```bash
-python3 scripts/evaluate_common_voice.py \
+python3 backend/scripts/evaluate_common_voice.py \
   --tsv /data/cv-corpus/en/test.tsv \
   --clips /data/cv-corpus/en/clips \
   --limit 500 \
@@ -258,22 +275,33 @@ The JSON report includes accuracy with unknown counted as error, coverage, accur
 
 With mode `none`, audio stays in memory only for the request or WebSocket session and is best-effort overwritten in `finally` blocks. With explicit `result_and_audio`, encoded bytes are written to S3-compatible storage and governed by the returned expiry/delete controls. Runtime inference remains local and never sends audio to a model host. This is data minimization, not a forensic zeroization guarantee.
 
-Before production, add TLS at the ingress, authentication, tenant authorization, rate limits, network policies, request-body logging exclusions, crash-dump controls, and jurisdiction-specific consent/notice. Full controls and the threat boundary are in [docs/PRIVACY.md](docs/PRIVACY.md).
+Before production, add TLS at the ingress, authentication, tenant authorization, rate limits, network policies, request-body logging exclusions, crash-dump controls, and jurisdiction-specific consent/notice. Full controls and the threat boundary are in [backend/docs/PRIVACY.md](backend/docs/PRIVACY.md).
+
+## Known limitations
+
+- The default ECAPA/SVM/SVR model is a runnable baseline, not a logistics-domain production accuracy claim.
+- Age and perceived voice-presentation estimates can be wrong or abstain, especially for short, noisy, narrowband, accented, multilingual, or out-of-domain speech.
+- Mixed agent/caller audio is not diarized; integrations must send the caller channel only.
+- Language and accent detection are not implemented.
+- The local history API has no tenant authentication, and the bundled object store is for demonstration only.
+- The WavLM production path requires an owned, evaluated ONNX artifact; public backbone weights alone do not provide the required heads or calibration.
+
+See the [model card](backend/docs/MODEL_CARD.md) and [privacy checklist](backend/docs/PRIVACY.md) before production use.
 
 ## Documentation
 
-- [API contract and examples](docs/API.md)
-- [Model-selection decision record](docs/ADR-001-model-selection.md)
-- [Production model strategy and ranked alternatives](docs/ADR-002-production-model-strategy.md)
-- [Opt-in PostgreSQL/S3 persistence decision](docs/ADR-003-opt-in-persistence.md)
-- [200-word design write-up](docs/DESIGN.md)
-- [Privacy and data lifecycle](docs/PRIVACY.md)
-- [Browser and telephony streaming design](docs/STREAMING.md)
-- [Model card and limitations](docs/MODEL_CARD.md)
-- [Sample audio instructions](samples/README.md)
-- [Third-party model notices](THIRD_PARTY_NOTICES.md)
-- `scripts/evaluate_common_voice.py` for public-dataset evaluation
+- [API contract and setup examples](backend/docs/API.md)
+- [Model-selection decision record](backend/docs/ADR-001-model-selection.md)
+- [Production model rationale and ranked alternatives](backend/docs/ADR-002-production-model-strategy.md)
+- [Opt-in PostgreSQL/S3 persistence decision](backend/docs/ADR-003-opt-in-persistence.md)
+- [200-word design write-up](backend/docs/DESIGN.md)
+- [Privacy and data lifecycle](backend/docs/PRIVACY.md)
+- [Browser and telephony streaming design](backend/docs/STREAMING.md)
+- [Model card and known limitations](backend/docs/MODEL_CARD.md)
+- [Sample audio instructions](backend/samples/README.md)
+- [Third-party model notices](backend/THIRD_PARTY_NOTICES.md)
+- `backend/scripts/evaluate_common_voice.py` for public-dataset evaluation
 
 ## License
 
-Service code is licensed under [MIT](LICENSE). Upstream weights and dependencies retain their own licenses. See the commercial-use analysis in [ADR-001](docs/ADR-001-model-selection.md); it is documentation, not legal advice.
+Service code is licensed under [MIT](LICENSE). Upstream weights and dependencies retain their own licenses. See the commercial-use analysis in [ADR-001](backend/docs/ADR-001-model-selection.md); it is documentation, not legal advice.

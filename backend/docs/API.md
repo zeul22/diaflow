@@ -32,7 +32,7 @@ Send a supported `audio/*` content type, such as WAV, MP3, FLAC, Ogg, or WebM. W
 curl -sS -X POST \
   'http://localhost:8000/analyze?contact_id=123e4567-e89b-12d3-a456-426614174000' \
   -H 'Content-Type: audio/wav' \
-  --data-binary @samples/caller.wav
+  --data-binary @backend/samples/caller.wav
 ```
 
 HTTP `Content-Encoding` compression, including gzip, is rejected. Codec compression inside an audio container is supported.
@@ -43,7 +43,7 @@ The audio field may be named `audio` or `file`; exactly one non-empty audio part
 
 ```bash
 curl -sS -X POST http://localhost:8000/analyze \
-  -F 'audio=@samples/caller.mp3;type=audio/mpeg' \
+  -F 'audio=@backend/samples/caller.mp3;type=audio/mpeg' \
   -F 'contact_id=123e4567-e89b-12d3-a456-426614174000'
 ```
 
@@ -67,7 +67,7 @@ Raw audio needs explicit encoding, rate, and channel metadata in the query, head
 curl -sS -X POST \
   'http://localhost:8000/analyze?encoding=mulaw&sample_rate=8000&channels=1' \
   -H 'Content-Type: application/octet-stream' \
-  --data-binary @samples/caller.mulaw
+  --data-binary @backend/samples/caller.mulaw
 ```
 
 The same metadata can be sent as `X-Audio-Encoding`, `X-Audio-Sample-Rate`, and `X-Audio-Channels` headers.
@@ -225,7 +225,7 @@ Browser `MediaRecorder` chunks are normally compressed WebM/Opus or MP4/AAC cont
 Create headerless input:
 
 ```bash
-ffmpeg -y -i samples/caller.wav -f s16le -ac 1 -ar 16000 samples/caller.s16le
+ffmpeg -y -i backend/samples/caller.wav -f s16le -ac 1 -ar 16000 backend/samples/caller.s16le
 python -m pip install 'websockets>=13,<16'
 ```
 
@@ -250,7 +250,7 @@ async def receive_predictions(socket):
 
 
 async def main():
-    audio = Path("samples/caller.s16le").read_bytes()
+    audio = Path("backend/samples/caller.s16le").read_bytes()
     async with websockets.connect("ws://localhost:8000/ws/analyze") as socket:
         await socket.send(json.dumps({
             "type": "start",

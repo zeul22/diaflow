@@ -12,11 +12,11 @@ Face model cards declare the Apache License 2.0:
 The complete Apache License 2.0 text is included in the image at
 `/licenses/Apache-2.0.txt`. The service's MIT license is included at
 `/licenses/service-MIT.txt`. Exact model file hashes and immutable sources are in
-`/opt/models/model-metadata.json` and `scripts/prepare_models.py`.
+`/opt/models/model-metadata.json` and `backend/scripts/prepare_models.py`.
 
 The upstream repositories did not expose separate `LICENSE` files at the pinned
 model revisions; their model-card license declarations are linked and discussed
-in `docs/ADR-001-model-selection.md`. No endorsement by the model authors is
+in `backend/docs/ADR-001-model-selection.md`. No endorsement by the model authors is
 implied. Model and training-data terms are distinct from this service's code
 license, and downstream distributors remain responsible for legal review and any
 required attribution or notice updates.

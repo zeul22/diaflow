@@ -8,10 +8,10 @@ __pycache__
 *.log
 coverage.xml
 htmlcov
-docs
-samples
-frontend/node_modules
-frontend/dist
+backend/docs
+backend/samples
+backend/models
+frontend
 
 # Never send local caller recordings into a Docker build context.
 *.aac

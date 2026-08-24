@@ -11,6 +11,8 @@ coverage.xml
 htmlcov/
 /build/
 /models/
+/backend/build/
+/backend/models/
 frontend/node_modules/
 frontend/dist/
 
