@@ -50,6 +50,9 @@ services:
     environment:
       LOG_LEVEL: INFO
       INFERENCE_CONCURRENCY: "1"
+      # Demonstrates the optional language field. Set to "none" to drop the
+      # second encoder pass and roughly halve inference latency.
+      LANGUAGE_BACKEND: voxlingua_ecapa
       QUEUE_TIMEOUT_SECONDS: "1.0"
       MAX_AUDIO_SECONDS: "30"
       MAX_UPLOAD_BYTES: "12582912"

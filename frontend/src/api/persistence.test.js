@@ -48,7 +48,7 @@ describe("persistence API", () => {
       default_mode: "none",
     });
     expect(fetchMock).toHaveBeenCalledWith(
-      "/api/persistence/capabilities",
+      "/api/v1/persistence/capabilities",
       expect.objectContaining({ cache: "no-store" }),
     );
   });
@@ -79,17 +79,17 @@ describe("persistence API", () => {
 
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
-      "/api/analyses",
+      "/api/v1/analyses",
       expect.objectContaining({ cache: "no-store" }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
-      "/api/analyses/analysis%2F8",
+      "/api/v1/analyses/analysis%2F8",
       expect.objectContaining({ cache: "no-store" }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       3,
-      "/api/analyses/analysis%2F8",
+      "/api/v1/analyses/analysis%2F8",
       expect.objectContaining({ method: "DELETE" }),
     );
   });

@@ -868,6 +868,11 @@ def _model_payload(value: Any) -> Mapping[str, Any]:
         value = model_dump(mode="json", exclude_none=True)
     if not isinstance(value, Mapping):
         raise ValueError("persisted result must be an object")
+    if "debug_age_years" in value:
+        # Evaluation-only diagnostics never enter retained records: a stored
+        # point estimate of a caller's age is more sensitive than the bracket
+        # the API contract promises, and has no retention basis.
+        value = {key: item for key, item in value.items() if key != "debug_age_years"}
     return value
 
 

@@ -13,7 +13,14 @@ RUN pip install \
     "scikit-learn==1.5.2"
 
 COPY backend/scripts/prepare_models.py /usr/local/bin/prepare_models.py
-RUN python /usr/local/bin/prepare_models.py --output /opt/models
+# The pinned griko SVM was fitted with probability=False, so it exposes no
+# predict_proba and no Platt parameters exist to convert. The exported gender
+# score is therefore monotonic in the decision value and is NOT a calibrated
+# probability. The flag makes that fact explicit in the artifact and in
+# /opt/models/model-metadata.json instead of silently shipping a fallback
+# sigmoid that looks like one. Remove it once a calibrated head is available.
+RUN python /usr/local/bin/prepare_models.py --output /opt/models \
+      --allow-uncalibrated-gender
 
 
 FROM python:3.11-slim-bookworm AS runtime
@@ -30,6 +37,11 @@ ENV DEBIAN_FRONTEND=noninteractive \
     MODEL_ROOT=/opt/models \
     MODEL_DEVICE=cpu \
     TORCH_THREADS=2
+
+# This baseline image knowingly serves the uncalibrated gender score exported
+# above. A production image built on a calibrated head must drop this so the
+# runtime fails closed rather than serving a score shaped like a probability.
+ENV REQUIRE_CALIBRATED_GENDER=false
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates ffmpeg libsndfile1 \

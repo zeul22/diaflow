@@ -16,13 +16,69 @@ htmlcov/
 frontend/node_modules/
 frontend/dist/
 
-# Caller audio is PII and must stay local.
+# Caller audio is PII and must stay local. backend/samples/README.md tells
+# contributors to create caller.wav here; this is what keeps it out of history.
+# Use `git add -f` for a deliberate non-voice asset such as a demo recording.
 *.aac
+*.aiff
+*.amr
+*.au
+*.caf
 *.flac
 *.m4a
 *.mp3
+*.mp4
 *.ogg
 *.opus
 *.pcm
+*.raw
 *.wav
 *.webm
+*.wma
+
+# Model weights are downloaded by pinned revision and SHA-256 at image build
+# time, converted in a disposable stage, and never committed (see ADR-001).
+# Ignoring them by extension makes an accidental commit of a large binary, or of
+# an unverified artifact, hard to do by mistake.
+*.bin
+*.ckpt
+*.joblib
+*.npz
+*.onnx
+*.pt
+*.pth
+*.safetensors
+
+# Evaluation corpora. The Common Voice harness asks contributors to download a
+# release locally; those are gigabytes and carry their own licence terms.
+/data/
+cv-corpus*/
+common_voice*/
+
+# Local deployment overrides, which routinely hold credentials and host paths.
+# docker-compose.wavlm.yml is intentionally tracked; the override file is not.
+docker-compose.override.yml
+docker-compose.override.yaml
+.env.*
+!.env.example
+
+# Generated output in any workspace, not only the two that exist today.
+node_modules/
+dist/
+.eslintcache
+.vite/
+*.tsbuildinfo
+coverage/
+.mypy_cache/
+.tox/
+
+# Editors and operating systems.
+.idea/
+.vscode/
+*.swp
+*~
+*.orig
+*.rej
+Thumbs.db
+desktop.ini
+*.log

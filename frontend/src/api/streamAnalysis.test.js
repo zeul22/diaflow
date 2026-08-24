@@ -169,7 +169,7 @@ describe("LiveAnalysisSession", () => {
       onState,
     });
 
-    expect(factory.mock.calls[0][0]).toMatch(/^ws:\/\/.*\/api\/ws\/analyze$/);
+    expect(factory.mock.calls[0][0]).toMatch(/^ws:\/\/.*\/api\/v1\/ws\/analyze$/);
     expect(socket.binaryType).toBe("arraybuffer");
     expect(JSON.parse(socket.sent[0])).toEqual({
       type: "start",
@@ -398,10 +398,10 @@ describe("LiveAnalysisSession", () => {
 
   it("builds secure and insecure same-origin WebSocket URLs", () => {
     expect(analysisWebSocketUrl({ protocol: "https:", host: "voice.example" })).toBe(
-      "wss://voice.example/api/ws/analyze",
+      "wss://voice.example/api/v1/ws/analyze",
     );
     expect(analysisWebSocketUrl({ protocol: "http:", host: "localhost:3000" })).toBe(
-      "ws://localhost:3000/api/ws/analyze",
+      "ws://localhost:3000/api/v1/ws/analyze",
     );
   });
 });

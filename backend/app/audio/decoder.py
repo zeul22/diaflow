@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import numpy as np
 import numpy.typing as npt
 
+from app.audio.resample import resample
 from app.audio.types import SourceSpec
 from app.config import Settings
 from app.errors import InvalidAudioError
@@ -97,9 +98,9 @@ class AudioDecoder:
             )
 
         if sample_rate != self.settings.target_sample_rate:
-            samples = self._resample_linear(
-                samples, sample_rate, self.settings.target_sample_rate
-            )
+            # Band-limited conversion: linear interpolation folded everything
+            # above the target Nyquist straight into the speech band.
+            samples = resample(samples, sample_rate, self.settings.target_sample_rate)
             sample_rate = self.settings.target_sample_rate
 
         samples = np.nan_to_num(
@@ -215,19 +216,6 @@ class AudioDecoder:
         magnitude = np.where(segment > 1, magnitude << shift, magnitude)
         signed = np.where((encoded & 0x80) != 0, magnitude, -magnitude)
         return (signed.astype(np.float32) / 32768.0).astype(np.float32)
-
-    @staticmethod
-    def _resample_linear(
-        samples: npt.NDArray[np.float32], source_rate: int, target_rate: int
-    ) -> npt.NDArray[np.float32]:
-        if samples.size < 2:
-            return samples.astype(np.float32, copy=False)
-        output_size = max(1, int(round(samples.size * target_rate / source_rate)))
-        source_positions = np.arange(samples.size, dtype=np.float64)
-        target_positions = np.arange(output_size, dtype=np.float64) * (
-            source_rate / target_rate
-        )
-        return np.interp(target_positions, source_positions, samples).astype(np.float32)
 
     def _decode_with_ffmpeg(
         self, payload: bytes | bytearray

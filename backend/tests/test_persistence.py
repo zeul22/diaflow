@@ -469,3 +469,38 @@ def test_retention_cleanup_deletes_expired_session() -> None:
         await service.close()
 
     asyncio.run(scenario())
+
+
+def test_debug_age_estimate_is_stripped_before_persistence() -> None:
+    """A stored point estimate of a caller's age has no retention basis.
+
+    The bracket is what the contract promises and what consent covers; the raw
+    regressor output is a finer-grained personal inference that exists only for
+    offline evaluation, so it must not reach a retained record.
+    """
+
+    from app.persistence.service import _model_payload
+    from app.schemas import (
+        AgeBracketPrediction,
+        AnalysisResponse,
+        AudioQuality,
+        GenderPrediction,
+    )
+
+    response = AnalysisResponse(
+        contact_id=uuid4(),
+        gender=GenderPrediction(prediction="male", confidence=0.9),
+        age_bracket=AgeBracketPrediction(prediction="31-45", confidence=0.5),
+        processing_ms=12,
+        audio_quality=AudioQuality.GOOD,
+        debug_age_years=38.4,
+    )
+
+    payload = _model_payload(response)
+
+    assert "debug_age_years" not in payload
+    assert payload["age_bracket"]["prediction"] == "31-45"
+    # A plain mapping without the field is passed through untouched.
+    assert _model_payload({"age_bracket": {"prediction": "31-45"}}) == {
+        "age_bracket": {"prediction": "31-45"}
+    }

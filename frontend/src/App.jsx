@@ -4,6 +4,7 @@ import {
   AnalysisApiError,
   analyzeAudio,
   formatBytes,
+  languageName,
   validateAudioFile,
 } from "./api/analyze.js";
 import {
@@ -369,6 +370,15 @@ function ResultsPanel({ result, headingRef, onReset, persistenceMode, storage, s
       <div className="prediction-grid">
         <PredictionCard label="Perceived voice presentation" prediction={result.gender} />
         <PredictionCard label="Estimated age bracket" prediction={result.age_bracket} />
+        {result.language ? (
+          <PredictionCard
+            label="Spoken language"
+            prediction={{
+              ...result.language,
+              prediction: languageName(result.language.prediction),
+            }}
+          />
+        ) : null}
       </div>
 
       <dl className="result-metadata">
@@ -481,6 +491,17 @@ function StoredAnalysisDetail({ analysis, loading }) {
         <div><dt>Created</dt><dd>{formatStoredDate(analysis?.created_at || persistence.created_at)}</dd></div>
         <div><dt>Voice presentation</dt><dd>{predictionCopy(gender)}</dd></div>
         <div><dt>Age bracket</dt><dd>{predictionCopy(age)}</dd></div>
+        {result?.language ? (
+          <div>
+            <dt>Spoken language</dt>
+            <dd>
+              {predictionCopy({
+                ...result.language,
+                prediction: languageName(result.language.prediction),
+              })}
+            </dd>
+          </div>
+        ) : null}
         <div><dt>Audio quality</dt><dd>{result?.audio_quality || "—"}</dd></div>
         <div><dt>Retention</dt><dd>{PERSISTENCE_LABELS[mode] || mode}</dd></div>
         {Number.isFinite(persistence.segments_stored ?? persistence.segment_count ?? analysis?.segment_count) ? (

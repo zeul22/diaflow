@@ -31,6 +31,53 @@ def test_native_wav_decoder_resamples(settings) -> None:
     assert decoded.samples.dtype == np.float32
 
 
+@pytest.mark.parametrize(
+    ("encoding", "expected"),
+    [
+        # Verified bit-exact against FFmpeg's decoders across all 256 codes.
+        # These hand-written decoders carry the telephony path, which is the
+        # realistic logistics input, so the companding tables are pinned here.
+        (
+            "mulaw",
+            {
+                0: -0.9803467,
+                1: -0.9490967,
+                127: 0.0,
+                128: 0.9803467,
+                200: 0.041870117,
+                254: 0.00024414062,
+            },
+        ),
+        (
+            "alaw",
+            {
+                0: -0.16796875,
+                1: -0.16015625,
+                127: -0.025878906,
+                128: 0.16796875,
+                200: 0.014404297,
+                254: 0.026855469,
+            },
+        ),
+    ],
+)
+def test_g711_companding_matches_the_reference_decoders(encoding, expected) -> None:
+    decode = {
+        "mulaw": AudioDecoder._decode_mulaw,
+        "alaw": AudioDecoder._decode_alaw,
+    }[encoding]
+
+    decoded = decode(bytes(range(256)))
+
+    assert decoded.dtype == np.float32
+    assert decoded.size == 256
+    for code, value in expected.items():
+        assert decoded[code] == pytest.approx(value, abs=1e-6), f"code {code}"
+    # Companding is symmetric about the sign bit and stays in range.
+    assert np.abs(decoded).max() <= 1.0
+    assert decoded[:128].min() == pytest.approx(-decoded[128:].max(), abs=1e-6)
+
+
 def test_quality_gate_marks_narrowband_as_degraded(settings) -> None:
     samples = speechlike_pcm()
     quality = analyze_quality(
@@ -73,7 +120,7 @@ def test_wav_duration_is_bounded_before_resampling(settings, monkeypatch) -> Non
     def fail_if_called(*_args) -> np.ndarray:
         raise AssertionError("resampler ran before the source-duration check")
 
-    monkeypatch.setattr(decoder, "_resample_linear", fail_if_called)
+    monkeypatch.setattr("app.audio.decoder.resample", fail_if_called)
     with pytest.raises(Exception) as caught:
         decoder.decode(payload, SourceSpec(encoding="wav"))
 

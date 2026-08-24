@@ -16,6 +16,58 @@ const AUDIO_EXTENSIONS = new Set([
 const AGE_BRACKETS = new Set(["18-30", "31-45", "46-60", "60+", "unknown"]);
 const GENDER_LABELS = new Set(["female", "male", "unknown"]);
 const QUALITY_LABELS = new Set(["degraded", "good", "insufficient"]);
+const LANGUAGE_CODE_PATTERN = /^(unknown|[a-z]{2,8})$/;
+
+// The service returns an ISO-639 style tag from a 107-language model. Naming
+// every one of them here would be noise, so common tags get a readable name and
+// anything else falls back to the tag itself rather than showing nothing.
+const LANGUAGE_NAMES = {
+  ar: "Arabic",
+  bn: "Bengali",
+  cs: "Czech",
+  de: "German",
+  el: "Greek",
+  en: "English",
+  es: "Spanish",
+  fa: "Persian",
+  fi: "Finnish",
+  fr: "French",
+  gu: "Gujarati",
+  he: "Hebrew",
+  hi: "Hindi",
+  hu: "Hungarian",
+  id: "Indonesian",
+  it: "Italian",
+  ja: "Japanese",
+  kn: "Kannada",
+  ko: "Korean",
+  ml: "Malayalam",
+  mr: "Marathi",
+  ms: "Malay",
+  nl: "Dutch",
+  no: "Norwegian",
+  pa: "Punjabi",
+  pl: "Polish",
+  pt: "Portuguese",
+  ro: "Romanian",
+  ru: "Russian",
+  sv: "Swedish",
+  ta: "Tamil",
+  te: "Telugu",
+  th: "Thai",
+  tl: "Tagalog",
+  tr: "Turkish",
+  uk: "Ukrainian",
+  ur: "Urdu",
+  vi: "Vietnamese",
+  zh: "Chinese",
+};
+
+export function languageName(code) {
+  if (typeof code !== "string" || !code) return "—";
+  if (code === "unknown") return "Not determined";
+  return LANGUAGE_NAMES[code] || code.toUpperCase();
+}
 
 const FRIENDLY_ERRORS = {
   INPUT_TIMEOUT: "The upload timed out. Check the connection and try again.",
@@ -75,6 +127,18 @@ function isPrediction(value, allowedLabels) {
   );
 }
 
+export function isLanguagePrediction(value) {
+  return Boolean(
+    value &&
+      typeof value === "object" &&
+      typeof value.prediction === "string" &&
+      LANGUAGE_CODE_PATTERN.test(value.prediction) &&
+      Number.isFinite(value.confidence) &&
+      value.confidence >= 0 &&
+      value.confidence <= 1,
+  );
+}
+
 export function isAnalysisResponse(value) {
   return Boolean(
     value &&
@@ -84,7 +148,11 @@ export function isAnalysisResponse(value) {
       isPrediction(value.age_bracket, AGE_BRACKETS) &&
       Number.isFinite(value.processing_ms) &&
       value.processing_ms >= 0 &&
-      QUALITY_LABELS.has(value.audio_quality),
+      QUALITY_LABELS.has(value.audio_quality) &&
+      // Language is optional: deployments can run without the second encoder.
+      (value.language === undefined ||
+        value.language === null ||
+        isLanguagePrediction(value.language)),
   );
 }
 
@@ -101,7 +169,7 @@ export async function analyzeAudio({
 
   let response;
   try {
-    response = await fetch("/api/analyze", {
+    response = await fetch("/api/v1/analyze", {
       method: "POST",
       body: form,
       signal,

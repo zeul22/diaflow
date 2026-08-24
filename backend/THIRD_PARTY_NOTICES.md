@@ -8,6 +8,7 @@ Face model cards declare the Apache License 2.0:
 | [`speechbrain/spkrec-ecapa-voxceleb`](https://huggingface.co/speechbrain/spkrec-ecapa-voxceleb) | `0f99f2d0ebe89ac095bcc5903c4dd8f72b367286` | SpeechBrain project contributors |
 | [`griko/gender_cls_svm_ecapa_voxceleb`](https://huggingface.co/griko/gender_cls_svm_ecapa_voxceleb) | `25f3e5a3c1c172dceeb723d8061e3e80ba6c8d64` | Upstream model author `griko` |
 | [`griko/age_reg_svr_ecapa_voxceleb2`](https://huggingface.co/griko/age_reg_svr_ecapa_voxceleb2) | `1d2356ac55f51fbd3f327f1b9260860decb21233` | Upstream model author `griko` |
+| [`speechbrain/lang-id-voxlingua107-ecapa`](https://huggingface.co/speechbrain/lang-id-voxlingua107-ecapa) | `0253049ae131d6a4be1c4f0d8b0ff483a0f8c8e9` | SpeechBrain project contributors |
 
 The complete Apache License 2.0 text is included in the image at
 `/licenses/Apache-2.0.txt`. The service's MIT license is included at

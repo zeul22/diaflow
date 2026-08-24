@@ -50,15 +50,21 @@ The gate estimates duration, RMS level, voiced-frame coverage, SNR, clipping, sp
 
 Default insufficient triggers include duration below 1.25 seconds, estimated voiced speech below 0.65 seconds, speech ratio below 0.08, or RMS below -48 dBFS. Default degraded triggers include duration below two seconds, speech ratio below 0.22, SNR below 8 dB, clipping above 2%, low-frequency energy ratio above 0.55, or narrowband source. These are signal heuristics and may misclassify music, synthetic speech, unusual voices, or stationary noise.
 
-Insufficient audio returns both outputs as unknown with zero confidence and skips the model. Degraded audio continues but multiplies confidence by `0.75`. FFmpeg use is not itself a degradation trigger; missing probed metadata and known narrowband codecs remain conservative triggers.
+Insufficient audio returns both outputs as unknown with zero confidence and skips the model. Degraded audio continues, and rather than rescaling the reported confidence it requires the result to clear a stricter abstention threshold. FFmpeg use is not itself a degradation trigger; missing probed metadata and known narrowband codecs remain conservative triggers. A segment whose sub-window embeddings disagree about the speaker is also reported as degraded.
 
 ## Outputs and confidence
 
-The SVM yields two scores converted to probabilities. The build converter reproduces the source classifier's Platt-style mapping when available; otherwise its fallback sigmoid is only a monotonic score. Runtime normalizes the two values, picks the maximum, applies the quality factor, and returns unknown below `0.60`.
+Confidence is the model's own score at every stage. Quality never multiplies it; quality selects which threshold it must clear (`0.60`/`0.75` for gender, `0.35`/`0.45` for age on good/degraded audio).
 
-The SVR yields a continuous age. Values below 18 or non-finite values become unknown. Otherwise the age is mapped to the required bracket. Confidence is not emitted by the source SVR: the service assumes a normal residual distribution with ten-year sigma, calculates the probability mass inside the selected bracket conditional on age at least 18, applies the quality factor, and returns unknown below `0.28`.
+**Gender.** The pinned upstream SVM was fitted with `probability=False`, so it exposes no `predict_proba` and no Platt parameters exist to convert. The build exports an explicitly flagged uncalibrated margin sigmoid; the runtime refuses to load such an artifact unless `REQUIRE_CALIBRATED_GENDER=false`, which this baseline image sets and warns about at startup. **The baseline's gender confidence is therefore a monotonic function of the SVM decision margin, not a probability**, and its threshold is a margin cut-off. Runtime normalizes the two values and picks the maximum.
 
-Therefore confidence is a model/postprocessing score, not a verified probability that the contact has an identity or age. It is not calibrated on logistics calls. Returning `0.0` for unknown means the result was withheld; it does not reveal the original sub-threshold score. Non-finite ages and regression outliers outside 18–120 also abstain.
+**Age.** The SVR yields a continuous age; values below 18, above 120, or non-finite become unknown. Otherwise the age is mapped to its bracket and confidence is the modeled normal mass inside that bracket, conditional on the bounded adult support 18–120. The sigma combines the assumed ten-year population residual, this sample's standard deviation across the sub-window ensemble, and an extrapolation term outside the 20–70 range where the upstream head has training support.
+
+Two properties of the previous form are worth recording, because they are the reason the current one exists. Its fixed sigma made confidence a deterministic function of the distance to the nearest bracket edge — identical for every caller whose estimate landed on the same year, with a floor of `0.42` that sat above the configured threshold, so age never abstained on low confidence. And integrating the open `60+` bracket to infinity gave a 90-year estimate `0.999`, the API's highest confidence in the region where the model is least reliable. Ensemble spread now makes the score sample-specific and the threshold reachable; bounded support and extrapolation inflation cap the top bracket near `0.74` and make it decline as the estimate leaves the training range. Cross-bracket confidences remain incomparable, since `60+` is far wider than the others, and tail bias is still unmeasured.
+
+**Language (optional).** When `LANGUAGE_BACKEND=voxlingua_ecapa`, a separate Apache-2.0 VoxLingua107 ECAPA classifier adds a `language` tag. It is accepted only when the top posterior clears a floor *and* leads the runner-up by a margin, because mass spreads across 107 related languages; the reported confidence is the raw posterior. The model has no non-speech class and will confidently name a language for music, noise, or a test tone. Streaming sessions track the most recent confident detection, so a mid-call language switch is followed after a few seconds' lag and can be transiently wrong while the window holds both languages. It identifies a language and nothing else — never an accent, dialect, region, or nationality. See [ADR-004](ADR-004-language-identification.md).
+
+Confidence is therefore a model/postprocessing score, not a verified probability that the contact has an identity or age, and it is not calibrated on logistics calls. Returning `0.0` for unknown means the result was withheld; it does not reveal the original sub-threshold score.
 
 ## Training data and upstream evaluation
 
@@ -76,13 +82,13 @@ All figures above are upstream-reported. This repository has not independently r
 - Demographic bias: representation, label conventions, recording conditions, languages, accents, regions, and age distribution can cause unequal error and abstention rates.
 - Construct validity: a binary acoustic label cannot represent gender identity. Voices do not map reliably to identity categories.
 - Age uncertainty: the upstream MAE is large relative to some API brackets; errors near 31, 46, and 60 are amplified by hard boundaries.
-- Mixed speakers: without caller-channel isolation, the result may describe an agent, dispatcher, bystander, or whichever speaker dominates energy.
+- Mixed speakers: the sub-window homogeneity check downgrades an obviously mixed segment to `degraded`, but it is a coarse similarity test rather than diarization. Without caller-channel isolation the result may still describe an agent, dispatcher, bystander, or whichever speaker dominates energy.
 - Channel and noise: narrowband codecs, clipping, road/engine noise, music, reverberation, packet-loss concealment, and aggressive noise suppression change embeddings.
 - Voice state: illness, fatigue, stress, smoking, vocal training, acting, pitch modification, and assistive devices can shift predictions.
 - Synthetic or adversarial audio: cloned, converted, replayed, or deliberately manipulated speech is not detected.
 - Children: the contract exposes adult brackets only. An under-18 regression becomes unknown, but this must not be used to determine whether someone is a minor.
-- Confidence: the age score is heuristic, gender calibration is inherited/converted, and neither is validated for this domain.
-- Progressive streaming: every update analyzes cumulative audio and can change; only the final result should be treated as settled.
+- Confidence: the age score is a model of the residual rather than a measured one, the baseline's gender score has no calibration at all, and neither is validated for this domain.
+- Progressive streaming: every update re-analyzes a trailing window and can change; only the final result should be treated as settled.
 
 ## Evaluation requirements
 
@@ -107,9 +113,12 @@ Monitor aggregate quality distribution, unknown coverage, confidence histograms,
 
 ## Known gaps in this release
 
+- No calibrated gender head. The pinned upstream classifier cannot supply one, so the baseline serves an uncalibrated margin score behind an explicit opt-in.
+- `AGE_RESIDUAL_SIGMA_YEARS`, the age reliable range, and all four confidence thresholds are placeholders, not values derived from a coverage-versus-error curve.
 - A Common Voice harness is included, but no dataset, reproduced score, logistics-domain holdout, or calibration artifact is bundled.
 - No measured hardware-specific proof of the under-500 ms target.
-- No language/accent field.
+- No accent or dialect field, and no plan for one: see [ADR-004](ADR-004-language-identification.md).
+- Language identification is untested on telephony audio and has no non-speech reject class.
 - No diarization or caller-channel verification.
 - No bundled approved production WavLM ONNX artifact, quantization, GPU batching, or incremental streaming embeddings.
 - No built-in authentication, TLS, rate limiting, or tenant isolation.

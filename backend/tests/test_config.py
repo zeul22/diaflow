@@ -57,3 +57,48 @@ def test_known_wavlm_backend_is_accepted() -> None:
 def test_unknown_model_backend_is_rejected() -> None:
     with pytest.raises(ValueError, match="MODEL_BACKEND"):
         replace(Settings(), model_backend="mystery").validate()
+
+
+def test_degraded_audio_cannot_be_easier_to_pass_than_good_audio() -> None:
+    with pytest.raises(ValueError, match="GENDER_CONFIDENCE_THRESHOLD_DEGRADED"):
+        replace(
+            Settings(),
+            gender_confidence_threshold=0.80,
+            gender_confidence_threshold_degraded=0.60,
+        ).validate()
+    with pytest.raises(ValueError, match="AGE_CONFIDENCE_THRESHOLD_DEGRADED"):
+        replace(
+            Settings(),
+            age_confidence_threshold=0.50,
+            age_confidence_threshold_degraded=0.30,
+        ).validate()
+
+
+def test_age_reliable_range_must_be_ordered_and_adult() -> None:
+    with pytest.raises(ValueError, match="AGE_RELIABLE_MIN_YEARS"):
+        replace(Settings(), age_reliable_min_years=12.0).validate()
+    with pytest.raises(ValueError, match="AGE_RELIABLE_MIN_YEARS"):
+        replace(
+            Settings(), age_reliable_min_years=80.0, age_reliable_max_years=70.0
+        ).validate()
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("ws_emit_backoff", 0.5),
+        ("ws_max_emit_interval_seconds", 0.5),
+        ("ws_analysis_window_seconds", 1.0),
+        ("ws_analysis_window_seconds", 60.0),
+    ],
+)
+def test_invalid_progressive_streaming_configuration_fails_startup(
+    field, value
+) -> None:
+    with pytest.raises(ValueError):
+        replace(Settings(), **{field: value}).validate()
+
+
+def test_replica_count_is_bounded() -> None:
+    with pytest.raises(ValueError, match="INFERENCE_CONCURRENCY"):
+        replace(Settings(), inference_concurrency=64).validate()

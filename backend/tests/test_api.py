@@ -7,8 +7,10 @@ import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from app.main import create_app
+from app.main import _analysis_offset, _frame_bytes, create_app
+from app.models.base import RawAttributes
 from app.persistence import PersistenceService
+from app.schemas import WebSocketStart
 from tests.conftest import FakeEstimator, speechlike_pcm, wav_bytes
 from tests.test_persistence import FakeMetadataStore, FakeObjectStore, audio_settings
 
@@ -136,6 +138,118 @@ def test_websocket_emits_progressive_and_final_predictions(client) -> None:
         assert final["type"] == "prediction"
         assert final["is_final"] is True
     assert final["sequence"] == progressive["sequence"] + 1
+
+
+def test_progressive_updates_analyze_a_bounded_trailing_window() -> None:
+    start = WebSocketStart(
+        type="start", encoding="pcm_s16le", sample_rate=16_000, channels=1
+    )
+    limit_bytes = 10 * 16_000 * 2
+
+    # Under the analysis window the whole session buffer is used as-is.
+    assert _analysis_offset(limit_bytes, start, limit_bytes) == 0
+    # Above it, only the trailing window is re-analyzed, so a long session costs
+    # a constant amount per update instead of growing without bound.
+    assert _analysis_offset(limit_bytes * 3, start, limit_bytes) == limit_bytes * 2
+
+    stereo = start.model_copy(update={"channels": 2})
+    offset = _analysis_offset(limit_bytes * 4 + 3, stereo, limit_bytes)
+    assert offset % _frame_bytes(stereo) == 0
+
+
+def test_progressive_emissions_back_off_over_a_long_session(
+    client, fake_estimator: FakeEstimator
+) -> None:
+    raw_pcm = (speechlike_pcm(8.0) * 32767.0).astype("<i2").tobytes()
+    one_second = 16_000 * 2
+    predictions = []
+
+    with client.websocket_connect("/ws/analyze") as websocket:
+        websocket.send_json(
+            {
+                "type": "start",
+                "encoding": "pcm_s16le",
+                "sample_rate": 16_000,
+                "channels": 1,
+            }
+        )
+        for index in range(8):
+            websocket.send_bytes(raw_pcm[index * one_second : (index + 1) * one_second])
+        websocket.send_json({"type": "end"})
+        while True:
+            message = websocket.receive_json()
+            if message["type"] != "prediction":
+                continue
+            predictions.append(message)
+            if message["is_final"]:
+                break
+
+    progressive = [item for item in predictions if not item["is_final"]]
+    # A fixed one-second cadence would have re-run the model on every chunk.
+    assert 2 <= len(progressive) < 8
+    assert predictions[-1]["is_final"] is True
+    assert fake_estimator.calls == len(predictions)
+
+
+def test_a_changing_prediction_resets_the_progressive_cadence(settings) -> None:
+    """Backoff must not make a moving estimate look stale.
+
+    The alternating estimator changes its label on every call, so the interval
+    is reset each time and the session emits more often than the stable case.
+    """
+
+    class AlternatingEstimator:
+        name = "alternating-estimator"
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def predict(self, samples):
+            del samples
+            self.calls += 1
+            female = 0.92 if self.calls % 2 else 0.08
+            return RawAttributes(
+                gender_probabilities={"female": female, "male": 1.0 - female},
+                age_years=40.0,
+            )
+
+        def warmup(self) -> None:
+            return None
+
+    def count_progressive(estimator) -> int:
+        app = create_app(settings=settings, estimator=estimator)
+        raw_pcm = (speechlike_pcm(8.0) * 32767.0).astype("<i2").tobytes()
+        one_second = 16_000 * 2
+        seen = 0
+        with (
+            TestClient(app) as test_client,
+            test_client.websocket_connect("/ws/analyze") as websocket,
+        ):
+            websocket.send_json(
+                {
+                    "type": "start",
+                    "encoding": "pcm_s16le",
+                    "sample_rate": 16_000,
+                    "channels": 1,
+                }
+            )
+            for index in range(8):
+                websocket.send_bytes(
+                    raw_pcm[index * one_second : (index + 1) * one_second]
+                )
+            websocket.send_json({"type": "end"})
+            while True:
+                message = websocket.receive_json()
+                if message["type"] != "prediction":
+                    continue
+                if message["is_final"]:
+                    break
+                seen += 1
+        return seen
+
+    assert count_progressive(AlternatingEstimator()) > count_progressive(
+        FakeEstimator()
+    )
 
 
 def test_websocket_accepts_configured_browser_origin(client) -> None:

@@ -58,17 +58,23 @@ The Docker deployment limits exposure by running as a non-root user, dropping ca
 
 ## Logging and observability
 
-Structured logs contain UTC timestamp, severity, event, request ID, method, bounded path label, HTTP status, total duration, model name, inference duration, audio duration, and quality class. Persistence lifecycle events additionally contain the random analysis/session UUID so operators can reconcile failed writes/deletes; treat it as pseudonymous metadata. Logs do not intentionally include:
+Structured logs contain UTC timestamp, severity, event, request ID, method, bounded path label, HTTP status, total duration, model name, inference duration, audio duration, and quality class. Analysis events additionally carry processing facts and signal statistics that describe the *pipeline*, not the speaker: language-identification duration, applied AGC gain in dB, whether denoising ran, the sub-window count, the age-model disagreement in years, sub-window embedding similarity, and whether more than one speaker was suspected. WebSocket session events carry framing mode and transport-integrity counts (frames lost, reordered, duplicated). Persistence lifecycle events additionally contain the random analysis/session UUID so operators can reconcile failed writes/deletes; treat it as pseudonymous metadata.
+
+Logs do not intentionally include:
 
 - request bodies or audio samples;
 - HTTP query strings;
 - `contact_id`;
 - gender/age predictions or confidence;
+- the identified language, which is an inference about the caller — coverage is tracked in the aggregate `voice_attribute_language_results_total` metric instead;
+- the raw age estimate from `debug_age_years`, which is response-only and never logged or persisted;
 - embeddings, waveform features, or codec payloads.
 
-Prometheus metrics use bounded labels for path, status, backend, quality, and stable error code. They contain no per-caller identifier. Unexpected exception logs include a stack trace; application exceptions do not include payload content, but dependency messages should still be reviewed for leakage.
+The distinction the analysis event draws is deliberate: a duration, a gain, or a model-disagreement spread cannot identify or characterize a caller, whereas a predicted attribute can. Anything that names what the model concluded about the person belongs in the response, and in aggregate metrics, not in a per-request log line.
 
-The supplied frontend proxy disables Nginx access logging for `/api/analyze`, stored-analysis routes, and the WebSocket endpoint. Its remaining access logs record the normalized path only, not the query string. This prevents uploaded filenames, contact IDs, analysis IDs, and payloads from being written by the proxy's default request log. Container-platform log collection still needs access control and an appropriate retention policy.
+Prometheus metrics use bounded labels for path, status, backend, quality, stable error code, rate-limit transport, and language outcome. They contain no per-caller identifier. Path labels have the `/v1` prefix stripped so a version migration does not split a time series. Unexpected exception logs include a stack trace; application exceptions do not include payload content, but dependency messages should still be reviewed for leakage.
+
+The supplied frontend proxy disables Nginx access logging for the analyze endpoint, stored-analysis routes, and the WebSocket endpoint, under both the versioned `/api/v1/...` paths the UI calls and the deprecated unversioned aliases. Each endpoint is listed explicitly rather than proxying all of `/api/`: that allowlist is what keeps `/metrics`, `/docs`, and `/openapi.json` off the public proxy. Its remaining access logs record the normalized path only, not the query string. This prevents uploaded filenames, contact IDs, analysis IDs, and payloads from being written by the proxy's default request log. Container-platform log collection still needs access control and an appropriate retention policy.
 
 Configure ingress, WAF, service mesh, APM, tracing, and support tooling to exclude request/response bodies, query strings, `X-Contact-ID`, WebSocket frames, and multipart content. Protect logs and metrics with access control and short, justified retention.
 
@@ -86,7 +92,7 @@ Mode `none` retains application audio only for one request/session plus cleanup.
 
 The calling system may separately store `contact_id`, outputs, or a caller association and therefore must define its own retention, deletion, subject-access, and audit processes. Deleting this service's analysis does not delete external copies. Backups, replicas, object versions, and legal holds require an explicit erasure policy.
 
-The app terminates an HTTP upload after ten seconds without a body chunk and a WebSocket after 30 seconds without a frame or 120 seconds total by default. It also enforces byte and 30-second audio limits. Keep stricter, independently enforced ingress idle and maximum connection durations before production; application timers are defense in depth, not protection against connections that never reach the process.
+The app terminates an HTTP upload after ten seconds without a body chunk and a WebSocket after 30 seconds without a frame or 120 seconds total by default. It also enforces byte and 30-second audio limits, for streams as well as uploads, which bounds how much caller audio one session can put through the process at all. Keep stricter, independently enforced ingress idle and maximum connection durations before production; application timers are defense in depth, not protection against connections that never reach the process.
 
 ## Sensitive inference and fairness
 

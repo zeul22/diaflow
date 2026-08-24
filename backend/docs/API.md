@@ -2,7 +2,11 @@
 
 Base URL in the supplied Compose deployment: `http://localhost:8000`.
 
-The application has no built-in TLS, authentication, tenant authorization, or rate limiting. Put it behind an authenticated TLS ingress before accepting real caller audio.
+Business endpoints are served under **`/v1`**. Unversioned paths remain mounted as deprecated aliases for existing integrations and are omitted from the OpenAPI schema; new clients should use `/v1`. `/healthz`, `/readyz` and `/metrics` are unversioned by design — they are operational contracts with the orchestrator and scraper rather than part of this API.
+
+The application applies **per-client rate limiting** (60 requests/minute, burst 10 by default): over-budget HTTP requests return `429 RATE_LIMITED` with a `Retry-After` header, and over-budget WebSocket handshakes are closed with code `1013` before being accepted. The limit is per container, so it is defence in depth rather than a global quota. Probes and metrics are never throttled.
+
+The application has **no built-in TLS, authentication, or tenant authorization**. TLS terminates at the ingress by design; run uvicorn with `--proxy-headers --forwarded-allow-ips=<ingress CIDR>` so the service sees the real scheme and client address, otherwise HSTS never fires and every caller shares one rate-limit bucket. Put the service behind an authenticated TLS ingress before accepting real caller audio: rate limiting narrows the blast radius of an anonymous caller but does not establish who anyone is.
 
 ## POST `/analyze`
 
@@ -90,7 +94,11 @@ The payload must contain one contact speaker. There is no source separation, ech
     "confidence": 0.63
   },
   "processing_ms": 142,
-  "audio_quality": "good"
+  "audio_quality": "good",
+  "language": {
+    "prediction": "en",
+    "confidence": 0.47
+  }
 }
 ```
 
@@ -116,12 +124,18 @@ These fields extend the normal response; the abbreviated object above shows only
 
 `gender.prediction` is `male`, `female`, or `unknown`. It is perceived binary voice presentation under the upstream labels, not gender identity. `age_bracket.prediction` is `18-30`, `31-45`, `46-60`, `60+`, or `unknown`. Ages regressed outside the service's plausible adult range of 18–120 become unknown.
 
-Confidence is bounded to `[0,1]` but is not yet calibrated on logistics calls. If a prediction misses its configured threshold, the service returns `unknown` with confidence `0.0`; it does not expose the sub-threshold score. `processing_ms` covers decode, quality analysis, queueing, and inference inside the service.
+`language` is present only when the deployment sets `LANGUAGE_BACKEND=voxlingua_ecapa`; it is omitted entirely otherwise, so an absent field means "not configured" and `unknown` means "not determined". `language.prediction` is an ISO-639 style tag such as `en`, `hi`, or `th`, or `unknown`. It names a spoken language and nothing else — not a locale, accent, dialect, region, or nationality — and the model has no non-speech class, so music or noise can still produce a tag.
+
+Over a WebSocket session the field tracks the most recent confident detection, so a caller who switches language is followed rather than reported as the language they started in. Detection lags the switch by a few seconds and can be transiently wrong while the analysis window contains both languages; tune `LANGUAGE_REFRESH_SECONDS` and `WS_ANALYSIS_WINDOW_SECONDS` to trade latency against cost. An `unknown` window does not blank an established answer. See [ADR-004](ADR-004-language-identification.md).
+
+`debug_age_years` appears only when the deployment sets `EXPOSE_DEBUG_AGE_YEARS=true`. It is the regressor's raw estimate in years, including values outside 18–120 that the bracket mapping abstains on, and exists so the evaluation harness can measure MAE and the residual spread that `AGE_RESIDUAL_SIGMA_YEARS` encodes. It is not part of the API contract, is stripped before any result is persisted, and should stay off outside evaluation: a point estimate of a caller's age is a finer-grained inference than the bracket the contract promises.
+
+Confidence is bounded to `[0,1]` and is the model's own score. It is never rescaled by audio quality: degraded audio raises the abstention threshold the score has to clear instead, so the number a caller receives stays interpretable. It is not calibrated on logistics calls. In the shipped ECAPA baseline the gender score is additionally an uncalibrated monotonic function of the SVM decision margin, because the pinned upstream classifier was fitted without probability estimates — treat the gender threshold as a margin cut-off, not a probability. If a prediction misses its threshold, the service returns `unknown` with confidence `0.0`; it does not expose the sub-threshold score. `processing_ms` covers decode, quality analysis, queueing, and inference inside the service.
 
 `audio_quality` means:
 
-- `good`: enough estimated speech and no configured degradation trigger.
-- `degraded`: enough speech, but short/low-speech, noisy, clipped, low-frequency-heavy, or narrowband. Confidence is discounted.
+- `good`: enough estimated speech, no configured degradation trigger, and sub-window embeddings that agree on a single speaker.
+- `degraded`: enough speech, but short/low-speech, noisy, clipped, low-frequency-heavy, narrowband, or holding more than one apparent speaker. Both attributes must clear a stricter threshold.
 - `insufficient`: too short, too little estimated voice, too quiet, or almost no speech. Both attributes are unknown and the model is skipped.
 
 Quality decisions use heuristics, not transcription or speaker verification. A `good` label does not guarantee a correct attribute estimate.
@@ -173,7 +187,9 @@ The WebSocket endpoint accepts headerless raw PCM/G.711 only; it does not accept
 }
 ```
 
-`contact_id` is optional. `encoding` and `sample_rate` are required; channels defaults to one. Encoding must be `pcm_s16le`, `pcm_s16be`, `pcm_f32le`, `mulaw`, or `alaw`. `persistence_mode` defaults to `none`; `result_and_audio` also requires `consent_reference`. Send binary audio frames next. After at least 1.25 seconds, the server can emit another cumulative prediction for each configured one second of new audio. Finish with the exact text control object `{"type":"end"}`. `{"type":"ping"}` produces `{"type":"pong"}`. The server closes sessions after 30 seconds without a frame or 120 seconds total by default, returning `WS_IDLE_TIMEOUT` or `WS_SESSION_TIMEOUT`.
+`framing` defaults to `raw`. Set it to `seq32` to prefix every audio frame with a 4-byte big-endian sequence number, which lets the service reorder frames, drop duplicates, conceal gaps, and report a badly damaged stream as `degraded` instead of analysing a partly reconstructed voice; see [AUDIO_PIPELINE.md](AUDIO_PIPELINE.md).
+
+`contact_id` is optional. `encoding` and `sample_rate` are required; channels defaults to one. Encoding must be `pcm_s16le`, `pcm_s16be`, `pcm_f32le`, `mulaw`, or `alaw`. `persistence_mode` defaults to `none`; `result_and_audio` also requires `consent_reference`. Send binary audio frames next. After at least 1.25 seconds the server emits a provisional prediction, and the interval between further provisional results then grows by `WS_EMIT_BACKOFF` up to `WS_MAX_EMIT_INTERVAL_SECONDS`: early audio changes the estimate most, and a settled session should not pay for a full re-analysis every second. Each provisional result analyzes a bounded trailing window (`WS_ANALYSIS_WINDOW_SECONDS`) rather than the whole session, so per-update cost is constant; the final `end` result sees the entire session buffer. Finish with the exact text control object `{"type":"end"}`. `{"type":"ping"}` produces `{"type":"pong"}`. A session accepts at most `MAX_AUDIO_SECONDS` (default 30) of streamed audio, returning `AUDIO_TOO_LONG` beyond that, and closes after 30 seconds without a frame or 120 seconds total, returning `WS_IDLE_TIMEOUT` or `WS_SESSION_TIMEOUT`.
 
 For a retained session, the server first confirms its database identity:
 

@@ -28,6 +28,8 @@ GENDER_REPO = "griko/gender_cls_svm_ecapa_voxceleb"
 GENDER_REVISION = "25f3e5a3c1c172dceeb723d8061e3e80ba6c8d64"
 AGE_REPO = "griko/age_reg_svr_ecapa_voxceleb2"
 AGE_REVISION = "1d2356ac55f51fbd3f327f1b9260860decb21233"
+LANGUAGE_REPO = "speechbrain/lang-id-voxlingua107-ecapa"
+LANGUAGE_REVISION = "0253049ae131d6a4be1c4f0d8b0ff483a0f8c8e9"
 
 ECAPA_FILES = {
     "hyperparams.yaml": "6f78854fa04ba59e761437b76a2575d3aba5e5016de3e9b69f0c9a5077fb1a41",
@@ -35,6 +37,17 @@ ECAPA_FILES = {
     "mean_var_norm_emb.ckpt": "cd70225b05b37be64fc5a95e24395d804231d43f74b2e1e5a513db7b69b34c33",
     "classifier.ckpt": "fd9e3634fe68bd0a427c95e354c0c677374f62b3f434e45b78599950d860d535",
     "label_encoder.txt": "e13c3a167bb4112685670ee896d20e2b565af16b3a4ceeaa8689fa4d22adb8b9",
+}
+
+# The separate 107-language ECAPA classifier. Its encoder is trained for
+# language discrimination and cannot be replaced by the speaker embedding, so
+# enabling language identification costs a second forward pass.
+LANGUAGE_FILES = {
+    "hyperparams.yaml": "88fec9791a8416a152fb10834327e18d38e5bf7a351e9b714e08cdc4af05de6f",
+    "embedding_model.ckpt": "ab750d5c06d713477045fa798fab5d33e959dbc0dfe4de510a9a47844c79a19a",
+    "classifier.ckpt": "a50d9024ff58d317031c9787d4c6c614d454a87a8ef32f9d36338cd3ff57adbc",
+    "label_encoder.txt": "9f566d83c4f19168be4a0bf86c0c7dac7d3264a95105bcbf33a7c32b83ccc17f",
+    "normalizer.ckpt": "c369e01dfa2e0d84c6b116f33c7b94f1fe28c061642086538e93cde3d97c26ef",
 }
 
 GENDER_FILES = {
@@ -144,16 +157,27 @@ def _validate_kernel_model(model: Any, *, classifier: bool) -> None:
         )
 
 
-def _probability_calibration(model: Any) -> tuple[float, float, str, float | None]:
+def _probability_calibration(
+    model: Any, *, allow_uncalibrated: bool
+) -> tuple[float, float, str, float | None, bool]:
     support = np.asarray(model.support_vectors_, dtype=np.float64)
     step = max(1, support.shape[0] // 2_000)
     probe = support[::step][:2_000]
     try:
         probabilities = np.asarray(model.predict_proba(probe), dtype=np.float64)[:, 1]
-    except (AttributeError, RuntimeError):
-        # This is a monotonic confidence score, not held-out calibration. The eval
-        # harness reports ECE and should be used to replace it with domain calibration.
-        return math.log(3.0), 0.0, "margin_sigmoid", None
+    except (AttributeError, RuntimeError) as exc:
+        # A margin sigmoid is monotonic in the decision value and nothing more.
+        # Serving it behind a probability threshold would make GENDER_CONFIDENCE_
+        # THRESHOLD meaningless, so the build fails closed instead of shipping a
+        # number that only looks like a probability.
+        if not allow_uncalibrated:
+            raise RuntimeError(
+                "The source gender classifier exposes no predict_proba, so no "
+                "probability calibration can be recovered. Rebuild from a "
+                "calibrated classifier, or pass --allow-uncalibrated-gender to "
+                "produce an evaluation-only artifact."
+            ) from exc
+        return math.log(3.0), 0.0, "margin_sigmoid", None, False
 
     decisions = np.asarray(model.decision_function(probe), dtype=np.float64).reshape(-1)
     probabilities = np.clip(probabilities, 1e-6, 1.0 - 1e-6)
@@ -166,7 +190,7 @@ def _probability_calibration(model: Any) -> tuple[float, float, str, float | Non
         raise RuntimeError(
             f"SVC probability conversion parity failed (max error {max_error})"
         )
-    return float(slope), float(intercept), "libsvm_platt", max_error
+    return float(slope), float(intercept), "libsvm_platt", max_error, True
 
 
 def _label(value: Any, labels: list[str]) -> str:
@@ -178,7 +202,9 @@ def _label(value: Any, labels: list[str]) -> str:
     return normalized
 
 
-def _export_heads(temporary: Path, output: Path) -> dict[str, Any]:
+def _export_heads(
+    temporary: Path, output: Path, *, allow_uncalibrated: bool
+) -> dict[str, Any]:
     gender_scaler = joblib.load(temporary / "gender" / "scaler.joblib")
     gender_model = joblib.load(temporary / "gender" / "svm_model.joblib")
     age_scaler = joblib.load(temporary / "age" / "scaler.joblib")
@@ -190,8 +216,8 @@ def _export_heads(temporary: Path, output: Path) -> dict[str, Any]:
     _validate_kernel_model(age_model, classifier=False)
     gender_matrix, gender_bias = _linearize_scaler(gender_scaler)
     age_matrix, age_bias = _linearize_scaler(age_scaler)
-    slope, probability_intercept, calibration, calibration_error = (
-        _probability_calibration(gender_model)
+    slope, probability_intercept, calibration, calibration_error, calibrated = (
+        _probability_calibration(gender_model, allow_uncalibrated=allow_uncalibrated)
     )
     labels = ["female", "male"]
     negative_label = _label(gender_model.classes_[0], labels)
@@ -215,6 +241,7 @@ def _export_heads(temporary: Path, output: Path) -> dict[str, Any]:
         gender_degree=np.asarray([int(gender_model.degree)]),
         gender_probability_slope=np.asarray([slope]),
         gender_probability_intercept=np.asarray([probability_intercept]),
+        gender_probability_calibrated=np.asarray([int(calibrated)]),
         gender_positive_label=np.asarray([positive_label]),
         gender_negative_label=np.asarray([negative_label]),
         age_transform_matrix=age_matrix,
@@ -229,13 +256,14 @@ def _export_heads(temporary: Path, output: Path) -> dict[str, Any]:
     )
     return {
         "gender_probability_calibration": calibration,
+        "gender_probability_calibrated": calibrated,
         "gender_probability_conversion_max_error": calibration_error,
         "gender_support_vectors": int(gender_model.support_vectors_.shape[0]),
         "age_support_vectors": int(age_model.support_vectors_.shape[0]),
     }
 
 
-def prepare(output: Path) -> None:
+def prepare(output: Path, *, allow_uncalibrated: bool = False) -> None:
     output.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="voice-attribute-models-") as temp_name:
         temporary = Path(temp_name)
@@ -255,7 +283,9 @@ def prepare(output: Path) -> None:
                 temporary / "age" / filename,
                 digest,
             )
-        conversion = _export_heads(temporary, output)
+        conversion = _export_heads(
+            temporary, output, allow_uncalibrated=allow_uncalibrated
+        )
 
     ecapa_output = output / "ecapa"
     for filename, digest in ECAPA_FILES.items():
@@ -264,6 +294,16 @@ def prepare(output: Path) -> None:
             ECAPA_REVISION,
             filename,
             ecapa_output / filename,
+            digest,
+        )
+
+    language_output = output / "language"
+    for filename, digest in LANGUAGE_FILES.items():
+        _download(
+            LANGUAGE_REPO,
+            LANGUAGE_REVISION,
+            filename,
+            language_output / filename,
             digest,
         )
 
@@ -285,6 +325,11 @@ def prepare(output: Path) -> None:
                 "revision": AGE_REVISION,
                 "files": AGE_FILES,
             },
+            "language": {
+                "repo": LANGUAGE_REPO,
+                "revision": LANGUAGE_REVISION,
+                "files": LANGUAGE_FILES,
+            },
         },
         "conversion": conversion,
     }
@@ -297,10 +342,19 @@ def prepare(output: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--allow-uncalibrated-gender",
+        action="store_true",
+        help=(
+            "Export a gender head whose probabilities are an uncalibrated margin "
+            "sigmoid. The runtime then refuses to load it unless "
+            "REQUIRE_CALIBRATED_GENDER=false. Evaluation only."
+        ),
+    )
     args = parser.parse_args()
     if args.output.exists():
         shutil.rmtree(args.output)
-    prepare(args.output)
+    prepare(args.output, allow_uncalibrated=args.allow_uncalibrated_gender)
 
 
 if __name__ == "__main__":

@@ -68,7 +68,7 @@ async function readJson(response) {
 export async function getPersistenceCapabilities({ signal } = {}) {
   let response;
   try {
-    response = await fetch("/api/persistence/capabilities", {
+    response = await fetch("/api/v1/persistence/capabilities", {
       cache: "no-store",
       headers: { Accept: "application/json" },
       signal,
@@ -118,7 +118,7 @@ function historyError(response, payload, fallback) {
 export async function listStoredAnalyses({ signal } = {}) {
   let response;
   try {
-    response = await fetch("/api/analyses", {
+    response = await fetch("/api/v1/analyses", {
       cache: "no-store",
       headers: { Accept: "application/json" },
       signal,
@@ -161,7 +161,7 @@ export async function getStoredAnalysis(analysisId, { signal } = {}) {
 
   let response;
   try {
-    response = await fetch(`/api/analyses/${encodeURIComponent(normalizedId)}`, {
+    response = await fetch(`/api/v1/analyses/${encodeURIComponent(normalizedId)}`, {
       cache: "no-store",
       headers: { Accept: "application/json" },
       signal,
@@ -196,7 +196,7 @@ export async function deleteStoredAnalysis(analysisId, { signal } = {}) {
 
   let response;
   try {
-    response = await fetch(`/api/analyses/${encodeURIComponent(normalizedId)}`, {
+    response = await fetch(`/api/v1/analyses/${encodeURIComponent(normalizedId)}`, {
       method: "DELETE",
       headers: { Accept: "application/json" },
       signal,

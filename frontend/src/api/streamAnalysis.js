@@ -46,7 +46,7 @@ export class StreamAnalysisError extends Error {
 
 export function analysisWebSocketUrl(location = window.location) {
   const protocol = location.protocol === "https:" ? "wss:" : "ws:";
-  return `${protocol}//${location.host}/api/ws/analyze`;
+  return `${protocol}//${location.host}/api/v1/ws/analyze`;
 }
 
 function isPredictionMessage(payload) {

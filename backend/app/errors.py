@@ -51,6 +51,16 @@ class ServiceBusyError(ServiceError):
         )
 
 
+class RateLimitedError(ServiceError):
+    def __init__(self, retry_after_seconds: float) -> None:
+        super().__init__(
+            "RATE_LIMITED",
+            "Too many requests from this client; retry after the indicated delay",
+            429,
+        )
+        self.retry_after_seconds = retry_after_seconds
+
+
 class ModelUnavailableError(ServiceError):
     def __init__(self) -> None:
         super().__init__("MODEL_UNAVAILABLE", "The inference model is not ready", 503)

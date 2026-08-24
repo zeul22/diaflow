@@ -6,12 +6,13 @@ import json
 import logging
 import re
 import time
-from contextlib import asynccontextmanager
+from collections.abc import Iterator
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime
 from typing import Any
 from uuid import UUID, uuid4
 
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import CONTENT_TYPE_LATEST
@@ -23,12 +24,19 @@ from app.audio.ingest import (
     resolve_contact_id,
     wipe_buffer,
 )
+from app.audio.jitter import ReorderBuffer, parse_sequenced_frame
 from app.audio.types import SourceSpec, source_spec_from_values
 from app.config import Settings
-from app.errors import InputTimeoutError, InvalidRequestError, ServiceError
+from app.errors import (
+    InputTimeoutError,
+    InvalidRequestError,
+    RateLimitedError,
+    ServiceError,
+)
 from app.inference.service import AnalysisService
 from app.models.base import AttributeEstimator
-from app.models.factory import create_estimator
+from app.models.factory import create_estimator_pool, create_language_pool
+from app.models.pool import EstimatorPool
 from app.observability.logging import configure_logging
 from app.observability.metrics import Metrics
 from app.persistence import (
@@ -43,9 +51,11 @@ from app.persistence import (
 from app.persistence import (
     PersistenceMode as StorageMode,
 )
+from app.ratelimit import RateLimiter, client_key
 from app.schemas import (
     AnalysisResponse,
     ErrorResponse,
+    LanguagePrediction,
     PersistenceMode,
     PersistenceReceipt,
     PersistenceStatus,
@@ -54,6 +64,14 @@ from app.schemas import (
 
 logger = logging.getLogger(__name__)
 REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+# The supported prefix for business endpoints. Unversioned paths remain mounted
+# as deprecated aliases so existing integrations keep working, and are hidden
+# from the schema so /docs advertises only the versioned surface.
+API_PREFIX = "/v1"
+# Probes and metrics are deliberately unversioned: they are operational contracts
+# with the orchestrator and scrapers, not part of the caller-facing API.
+OPS_PATHS = {"/healthz", "/readyz", "/metrics"}
+RATE_LIMIT_EXEMPT = OPS_PATHS
 KNOWN_PATHS = {
     "/analyze",
     "/analyses",
@@ -310,8 +328,9 @@ def _manifest_payload(manifest: SessionManifest, *, detail: bool) -> dict[str, A
 def create_app(
     *,
     settings: Settings | None = None,
-    estimator: AttributeEstimator | None = None,
+    estimator: AttributeEstimator | EstimatorPool | None = None,
     persistence: PersistenceService | None = None,
+    language_pool: EstimatorPool | None = None,
 ) -> FastAPI:
     resolved_settings = settings or Settings.from_env()
     resolved_settings.validate()
@@ -322,14 +341,22 @@ def create_app(
     async def lifespan(application: FastAPI):
         storage = persistence or _build_persistence(resolved_settings)
         model = estimator or await asyncio.to_thread(
-            create_estimator, resolved_settings
+            create_estimator_pool, resolved_settings
+        )
+        language = (
+            language_pool
+            if language_pool is not None
+            else await asyncio.to_thread(create_language_pool, resolved_settings)
         )
         if resolved_settings.warmup_model:
             await asyncio.to_thread(model.warmup)
+            if language is not None:
+                await asyncio.to_thread(language.warmup)
         application.state.analysis_service = AnalysisService(
             settings=resolved_settings,
             estimator=model,
             metrics=metrics,
+            language=language,
         )
         await storage.connect()
         application.state.persistence_service = storage
@@ -340,6 +367,7 @@ def create_app(
                     "service": resolved_settings.service_name,
                     "version": resolved_settings.service_version,
                     "model": model.name,
+                    "language_model": language.name if language is not None else None,
                     "persistence_maximum": storage.maximum_mode.value,
                 }
             },
@@ -362,6 +390,44 @@ def create_app(
     )
     app.state.settings = resolved_settings
     app.state.metrics = metrics
+    router = APIRouter()
+    limiter = RateLimiter(
+        capacity=float(resolved_settings.rate_limit_burst),
+        refill_per_second=resolved_settings.rate_limit_requests_per_minute / 60.0,
+        max_clients=resolved_settings.rate_limit_max_tracked_clients,
+    )
+    app.state.rate_limiter = limiter
+
+    def _rate_limit(request: Request) -> None:
+        """Reject a client that is over its budget, before any work is done."""
+
+        if not resolved_settings.rate_limit_enabled:
+            return
+        if request.url.path in RATE_LIMIT_EXEMPT:
+            # Never throttle liveness, readiness, or metrics: doing so takes the
+            # container out of service and blinds the scrapers that would show why.
+            return
+        key = client_key(
+            request.client.host if request.client else None,
+            request.headers.get("x-forwarded-for"),
+            resolved_settings.trusted_proxy_hops,
+        )
+        retry_after = limiter.check(key, time.monotonic())
+        if retry_after > 0.0:
+            metrics.rate_limited.labels(transport="http").inc()
+            raise RateLimitedError(retry_after)
+
+    def _security_headers(request: Request, response) -> None:
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        forwarded_proto = request.headers.get("x-forwarded-proto", "").lower()
+        secure = request.url.scheme == "https" or forwarded_proto == "https"
+        if secure and resolved_settings.hsts_max_age_seconds > 0:
+            # Only ever sent over HTTPS. Announcing HSTS on a plaintext response
+            # is ignored by browsers and would be a lie besides.
+            response.headers["Strict-Transport-Security"] = (
+                f"max-age={resolved_settings.hsts_max_age_seconds}"
+            )
 
     @app.middleware("http")
     async def request_observability(request: Request, call_next):
@@ -370,9 +436,27 @@ def create_app(
         started = time.perf_counter()
         status_code = 500
         try:
+            try:
+                _rate_limit(request)
+            except RateLimitedError as limited:
+                status_code = limited.status_code
+                metrics.errors.labels(code=limited.code).inc()
+                response = JSONResponse(
+                    status_code=limited.status_code,
+                    content=_error_payload(limited, request_id),
+                    headers={
+                        "Retry-After": str(
+                            max(1, int(limited.retry_after_seconds + 0.5))
+                        )
+                    },
+                )
+                response.headers["X-Request-ID"] = request_id
+                _security_headers(request, response)
+                return response
             response = await call_next(request)
             status_code = response.status_code
             response.headers["X-Request-ID"] = request_id
+            _security_headers(request, response)
             if request.url.path == "/analyses" or request.url.path.startswith(
                 "/analyses/"
             ):
@@ -381,6 +465,8 @@ def create_app(
         finally:
             elapsed = time.perf_counter() - started
             metric_path = request.url.path
+            if metric_path.startswith(f"{API_PREFIX}/"):
+                metric_path = metric_path[len(API_PREFIX) :]
             if metric_path.startswith("/analyses/"):
                 metric_path = "/analyses/{id}"
             elif metric_path not in KNOWN_PATHS:
@@ -389,7 +475,15 @@ def create_app(
                 path=metric_path, status=str(status_code)
             ).inc()
             metrics.http_duration.labels(path=metric_path).observe(elapsed)
-            logger.info(
+            # A succeeding probe is the least informative line a log can carry,
+            # and the most frequent: the container healthcheck alone is ~5,800
+            # lines per day per container, before the UI's own polling. They are
+            # still counted in metrics, which is where a rate belongs. A *failing*
+            # probe is the opposite -- it explains why a container left the load
+            # balancer -- so anything other than success is still logged.
+            probe_succeeded = metric_path in OPS_PATHS and status_code < 400
+            log = logger.debug if probe_succeeded else logger.info
+            log(
                 "http_request_completed",
                 extra={
                     "event_data": {
@@ -460,7 +554,7 @@ def create_app(
     async def prometheus_metrics() -> Response:
         return Response(content=metrics.render(), media_type=CONTENT_TYPE_LATEST)
 
-    @app.post(
+    @router.post(
         "/analyze",
         response_model=AnalysisResponse,
         response_model_exclude_none=True,
@@ -572,7 +666,7 @@ def create_app(
                     logger.exception("persistence_rest_cleanup_failed")
             wipe_buffer(ingested.payload)
 
-    @app.get("/persistence/capabilities")
+    @router.get("/persistence/capabilities")
     async def persistence_capabilities(request: Request) -> dict[str, Any]:
         storage: PersistenceService = request.app.state.persistence_service
         return {
@@ -586,7 +680,7 @@ def create_app(
             "metadata_storage": "postgresql",
         }
 
-    @app.get("/analyses")
+    @router.get("/analyses")
     async def list_analyses(
         request: Request,
         contact_id: UUID | None = None,
@@ -608,7 +702,7 @@ def create_app(
             raise _persistence_error(exc) from exc
         return {"items": [_manifest_payload(item, detail=False) for item in manifests]}
 
-    @app.get("/analyses/{analysis_id}")
+    @router.get("/analyses/{analysis_id}")
     async def get_analysis(request: Request, analysis_id: UUID) -> dict[str, Any]:
         storage: PersistenceService = request.app.state.persistence_service
         try:
@@ -621,7 +715,7 @@ def create_app(
             )
         return _manifest_payload(manifest, detail=True)
 
-    @app.delete("/analyses/{analysis_id}")
+    @router.delete("/analyses/{analysis_id}")
     async def delete_analysis(request: Request, analysis_id: UUID) -> dict[str, str]:
         storage: PersistenceService = request.app.state.persistence_service
         try:
@@ -634,9 +728,15 @@ def create_app(
             )
         return {"analysis_id": str(analysis_id), "status": "deleted"}
 
-    @app.websocket("/ws/analyze")
+    @router.websocket("/ws/analyze")
     async def websocket_analyze(websocket: WebSocket) -> None:
         await _handle_websocket(websocket, resolved_settings)
+
+    # The versioned surface is authoritative; the unversioned aliases stay
+    # mounted so existing integrations keep working, and are hidden from the
+    # schema so /docs advertises only the path new clients should use.
+    app.include_router(router, prefix=API_PREFIX)
+    app.include_router(router, include_in_schema=False)
 
     return app
 
@@ -665,19 +765,94 @@ async def _receive_start(
         ) from exc
 
 
-def _stream_duration_seconds(buffer: bytearray, start: WebSocketStart) -> float:
-    return _stream_duration_for_bytes(len(buffer), start)
+_BYTES_PER_SAMPLE = {
+    "pcm_s16le": 2,
+    "pcm_s16be": 2,
+    "pcm_f32le": 4,
+    "mulaw": 1,
+    "alaw": 1,
+}
+
+
+def _frame_bytes(start: WebSocketStart) -> int:
+    return _BYTES_PER_SAMPLE[start.encoding] * start.channels
 
 
 def _stream_duration_for_bytes(byte_count: int, start: WebSocketStart) -> float:
-    bytes_per_sample = {
-        "pcm_s16le": 2,
-        "pcm_s16be": 2,
-        "pcm_f32le": 4,
-        "mulaw": 1,
-        "alaw": 1,
-    }[start.encoding]
-    return byte_count / (bytes_per_sample * start.channels * start.sample_rate)
+    return byte_count / (_frame_bytes(start) * start.sample_rate)
+
+
+def _analysis_offset(byte_count: int, start: WebSocketStart, limit_bytes: int) -> int:
+    """Byte offset of the bounded trailing slice, aligned to a frame boundary."""
+
+    if byte_count <= limit_bytes:
+        return 0
+    frame = _frame_bytes(start)
+    offset = byte_count - limit_bytes
+    return offset - (offset % frame)
+
+
+@contextmanager
+def _progressive_payload(
+    buffer: bytearray, start: WebSocketStart, settings: Settings
+) -> Iterator[bytes | bytearray]:
+    """Bound the audio a progressive update analyzes.
+
+    Re-analyzing the whole cumulative buffer every interval makes a session cost
+    quadratic in its length while adding nothing: the estimator only ever uses
+    one selected window. Analyzing a bounded trailing slice keeps each update at
+    constant cost. The copy is wiped afterwards so a progressive update does not
+    leave a second copy of caller audio behind. The final ``end`` analysis still
+    sees the whole session buffer, which the duration cap keeps bounded.
+    """
+
+    limit_bytes = int(
+        settings.ws_analysis_window_seconds * start.sample_rate
+    ) * _frame_bytes(start)
+    offset = _analysis_offset(len(buffer), start, limit_bytes)
+    if offset == 0:
+        yield buffer
+        return
+    trimmed = bytearray(memoryview(buffer)[offset:])
+    try:
+        yield trimmed
+    finally:
+        wipe_buffer(trimmed)
+
+
+def _transport_degraded(reorder: ReorderBuffer | None, settings: Settings) -> bool:
+    """True when the transport damaged enough of the stream to distrust it.
+
+    Concealed audio is synthetic. Past a threshold the estimate describes a
+    partly reconstructed voice, which the caller should be told about through the
+    quality field rather than left to discover.
+    """
+
+    if reorder is None:
+        return False
+    return reorder.integrity().loss_ratio > settings.ws_max_loss_ratio
+
+
+def _carry_language(
+    result: AnalysisResponse, previous: LanguagePrediction | None
+) -> tuple[AnalysisResponse, LanguagePrediction | None]:
+    """Report the most recent confident language, not the first one.
+
+    Callers switch language mid-call, so freezing the first answer would leave a
+    session permanently reporting a language nobody is speaking any more. A new
+    confident answer therefore replaces the old one. An `unknown` window does not:
+    it is far more often a bad window than a genuine loss of language, so the last
+    confident answer is carried forward rather than blanking the field.
+    """
+
+    language = result.language
+    if language is None:
+        return result, previous
+    if language.prediction != "unknown":
+        return result, language
+    if previous is None:
+        return result, None
+    return result.model_copy(update={"language": previous}), previous
 
 
 async def _send_prediction(
@@ -731,8 +906,31 @@ async def _handle_websocket(websocket: WebSocket, settings: Settings) -> None:
     accepted = False
     completed = False
     handle: PersistenceHandle | None = None
+    # Declared before the try so the finally can report transport integrity even
+    # for a session that failed before its start frame arrived.
+    reorder: ReorderBuffer | None = None
+    start_framing = "raw"
     started_at = time.perf_counter()
     try:
+        limiter = getattr(websocket.app.state, "rate_limiter", None)
+        if settings.rate_limit_enabled and limiter is not None:
+            # Checked before accept: an over-budget client should not get a
+            # session that then holds a model replica and a decode slot.
+            key = client_key(
+                websocket.client.host if websocket.client else None,
+                websocket.headers.get("x-forwarded-for"),
+                settings.trusted_proxy_hops,
+            )
+            if limiter.check(key, time.monotonic()) > 0.0:
+                websocket.app.state.metrics.rate_limited.labels(
+                    transport="websocket"
+                ).inc()
+                logger.warning(
+                    "websocket_rate_limited",
+                    extra={"event_data": {"request_id": request_id}},
+                )
+                await websocket.close(code=1013, reason="RATE_LIMITED")
+                return
         origin = websocket.headers.get("origin")
         if origin and origin.lower().rstrip("/") not in settings.ws_allowed_origins:
             logger.warning(
@@ -769,6 +967,24 @@ async def _handle_websocket(websocket: WebSocket, settings: Settings) -> None:
         )
         sequence = 0
         last_emitted_at = 0.0
+        # Progressive updates back off only while the answer is not moving. A
+        # purely geometric backoff left a settled session showing a stale card
+        # for seconds at a time; resetting on every label change keeps the UI
+        # responsive exactly when the estimate is still changing.
+        emit_interval = settings.ws_emit_interval_seconds
+        last_labels: tuple[str, str] | None = None
+        # Language is re-checked periodically rather than on every update: a
+        # second encoder pass per update is expensive, but never re-checking
+        # cannot notice a caller switching language. LANGUAGE_REFRESH_SECONDS is
+        # that trade, and the last confident answer is reused in between.
+        current_language: LanguagePrediction | None = None
+        language_checked_at = 0.0
+        start_framing = start.framing
+        reorder = (
+            ReorderBuffer(window=settings.ws_reorder_window_frames)
+            if start.framing == "seq32"
+            else None
+        )
         chunks_received = 0
         chunk_sizes: dict[int, int] = {}
         stored_chunk_bytes: dict[int, int] = {}
@@ -816,59 +1032,84 @@ async def _handle_websocket(websocket: WebSocket, settings: Settings) -> None:
             binary = message.get("bytes")
             text = message.get("text")
             if binary is not None:
-                projected_bytes = len(buffer) + len(binary)
-                if projected_bytes > settings.max_upload_bytes:
-                    from app.errors import RequestTooLargeError
+                # In sequenced mode one arriving frame can release several
+                # in-order frames, or none while a late one is still awaited.
+                if reorder is None:
+                    ordered = [bytes(binary)]
+                else:
+                    frame_sequence, frame_payload = parse_sequenced_frame(binary)
+                    ordered = reorder.push(frame_sequence, frame_payload)
+                for chunk in ordered:
+                    if not chunk:
+                        continue
+                    projected_bytes = len(buffer) + len(chunk)
+                    if projected_bytes > settings.max_upload_bytes:
+                        from app.errors import RequestTooLargeError
 
-                    raise RequestTooLargeError()
-                duration = _stream_duration_for_bytes(projected_bytes, start)
-                if duration > settings.max_audio_seconds:
-                    raise InvalidRequestError(
-                        "AUDIO_TOO_LONG",
-                        f"Stream exceeds the {settings.max_audio_seconds:g}-second limit",
-                    )
-                if handle.mode is StorageMode.RESULT_AND_AUDIO:
-                    chunk_sizes[chunks_received] = len(binary)
-                    stored = await storage.store_chunk(
-                        handle,
-                        binary,
-                        chunk_index=chunks_received,
-                    )
-                    chunks_received += 1
-                    for segment in stored:
-                        segments_stored += 1
-                        bytes_stored += segment.byte_size
-                        for item in segment.logical_chunks:
-                            stored_chunk_bytes[item.chunk_index] = (
-                                stored_chunk_bytes.get(item.chunk_index, 0)
-                                + item.source_byte_end
-                                - item.source_byte_start
-                            )
-                    chunks_stored = sum(
-                        stored_chunk_bytes.get(index, 0) >= size
-                        for index, size in chunk_sizes.items()
-                    )
-                    await _send_storage_progress(
-                        websocket,
-                        handle,
-                        _pending_receipt(
+                        raise RequestTooLargeError()
+                    duration = _stream_duration_for_bytes(projected_bytes, start)
+                    if duration > settings.max_audio_seconds:
+                        raise InvalidRequestError(
+                            "AUDIO_TOO_LONG",
+                            f"Stream exceeds the {settings.max_audio_seconds:g}-second "
+                            "limit",
+                        )
+                    if handle.mode is StorageMode.RESULT_AND_AUDIO:
+                        chunk_sizes[chunks_received] = len(chunk)
+                        stored = await storage.store_chunk(
                             handle,
-                            chunks_received=chunks_received,
-                            chunks_stored=chunks_stored,
-                            segments_stored=segments_stored,
-                            bytes_stored=bytes_stored,
-                        ),
-                    )
-                buffer.extend(binary)
+                            chunk,
+                            chunk_index=chunks_received,
+                        )
+                        chunks_received += 1
+                        for segment in stored:
+                            segments_stored += 1
+                            bytes_stored += segment.byte_size
+                            for item in segment.logical_chunks:
+                                stored_chunk_bytes[item.chunk_index] = (
+                                    stored_chunk_bytes.get(item.chunk_index, 0)
+                                    + item.source_byte_end
+                                    - item.source_byte_start
+                                )
+                        chunks_stored = sum(
+                            stored_chunk_bytes.get(index, 0) >= size
+                            for index, size in chunk_sizes.items()
+                        )
+                        await _send_storage_progress(
+                            websocket,
+                            handle,
+                            _pending_receipt(
+                                handle,
+                                chunks_received=chunks_received,
+                                chunks_stored=chunks_stored,
+                                segments_stored=segments_stored,
+                                bytes_stored=bytes_stored,
+                            ),
+                        )
+                    buffer.extend(chunk)
                 if (
-                    duration >= settings.min_audio_seconds
-                    and duration - last_emitted_at >= settings.ws_emit_interval_seconds
+                    buffer
+                    and duration >= settings.min_audio_seconds
+                    and duration - last_emitted_at >= emit_interval
                 ):
-                    result = await service.analyze(
-                        payload=buffer,
-                        source=source,
-                        contact_id=contact_id,
+                    recheck_language = (
+                        current_language is None
+                        or duration - language_checked_at
+                        >= settings.language_refresh_seconds
                     )
+                    with _progressive_payload(buffer, start, settings) as payload:
+                        result = await service.analyze(
+                            payload=payload,
+                            source=source,
+                            contact_id=contact_id,
+                            settled_language=(
+                                None if recheck_language else current_language
+                            ),
+                            transport_degraded=_transport_degraded(reorder, settings),
+                        )
+                    if recheck_language:
+                        language_checked_at = duration
+                    result, current_language = _carry_language(result, current_language)
                     if handle.enabled:
                         result = _with_persistence(
                             result,
@@ -889,6 +1130,18 @@ async def _handle_websocket(websocket: WebSocket, settings: Settings) -> None:
                         websocket, result, sequence=sequence, is_final=False
                     )
                     last_emitted_at = duration
+                    labels = (
+                        result.gender.prediction,
+                        result.age_bracket.prediction,
+                    )
+                    if last_labels == labels:
+                        emit_interval = min(
+                            settings.ws_max_emit_interval_seconds,
+                            emit_interval * settings.ws_emit_backoff,
+                        )
+                    else:
+                        emit_interval = settings.ws_emit_interval_seconds
+                    last_labels = labels
                 continue
 
             if text is None:
@@ -914,15 +1167,24 @@ async def _handle_websocket(websocket: WebSocket, settings: Settings) -> None:
                 raise InvalidRequestError(
                     "WS_PROTOCOL_ERROR", "Expected an end or ping control message"
                 )
+            if reorder is not None:
+                for chunk in reorder.flush():
+                    if chunk:
+                        buffer.extend(chunk)
             if not buffer:
                 raise InvalidRequestError(
                     "MISSING_AUDIO", "No audio chunks were received"
                 )
+            # The final result always re-checks: it has the most audio to work
+            # with, and a caller who switched language deserves the answer that
+            # reflects it rather than a cached earlier one.
             result = await service.analyze(
                 payload=buffer,
                 source=source,
                 contact_id=contact_id,
+                transport_degraded=_transport_degraded(reorder, settings),
             )
+            result, current_language = _carry_language(result, current_language)
             manifest = await storage.complete(
                 handle,
                 result=result,
@@ -972,6 +1234,7 @@ async def _handle_websocket(websocket: WebSocket, settings: Settings) -> None:
                 except PersistenceError:
                     logger.exception("persistence_websocket_cleanup_failed")
         wipe_buffer(buffer)
+        integrity = reorder.integrity() if reorder is not None else None
         logger.info(
             "websocket_session_completed",
             extra={
@@ -979,6 +1242,13 @@ async def _handle_websocket(websocket: WebSocket, settings: Settings) -> None:
                     "request_id": request_id,
                     "completed": completed,
                     "duration_ms": round((time.perf_counter() - started_at) * 1_000),
+                    "framing": start_framing,
+                    "frames_lost": integrity.frames_lost if integrity else 0,
+                    "frames_reordered": integrity.frames_reordered if integrity else 0,
+                    "frames_duplicated": (
+                        integrity.frames_duplicated if integrity else 0
+                    ),
+                    "loss_ratio": round(integrity.loss_ratio, 4) if integrity else 0.0,
                 }
             },
         )

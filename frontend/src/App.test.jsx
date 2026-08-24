@@ -49,7 +49,7 @@ function mockAnalyzer(
     if (url === "/api/readyz") {
       return Promise.resolve(response({ status: "ready" }));
     }
-    if (url === "/api/persistence/capabilities") return capabilitiesPromise;
+    if (url === "/api/v1/persistence/capabilities") return capabilitiesPromise;
     return analyzerPromise;
   });
   vi.stubGlobal("fetch", fetchMock);
@@ -57,7 +57,7 @@ function mockAnalyzer(
 }
 
 function analyzerCalls(fetchMock) {
-  return fetchMock.mock.calls.filter(([url]) => url === "/api/analyze");
+  return fetchMock.mock.calls.filter(([url]) => url === "/api/v1/analyze");
 }
 
 function installRecorderBrowser({ getUserMediaImpl } = {}) {
@@ -135,7 +135,7 @@ describe("Audio analyzer", () => {
     const calls = analyzerCalls(fetchMock);
     expect(calls).toHaveLength(1);
     const [url, options] = calls[0];
-    expect(url).toBe("/api/analyze");
+    expect(url).toBe("/api/v1/analyze");
     expect(options.method).toBe("POST");
     expect(options.body).toBeInstanceOf(FormData);
     const uploadedAudio = options.body.get("audio");
@@ -151,6 +151,44 @@ describe("Audio analyzer", () => {
 
     await user.click(screen.getByRole("button", { name: /analyze another/i }));
     expect(screen.getByLabelText(/contact id/i)).toHaveValue("");
+  });
+
+  it("shows a spoken-language card only when the deployment returns one", async () => {
+    const user = userEvent.setup();
+    mockAnalyzer(
+      Promise.resolve(
+        response({
+          ...successfulResult,
+          language: { prediction: "hi", confidence: 0.88 },
+        }),
+      ),
+    );
+    renderApp();
+
+    await user.upload(
+      screen.getByLabelText(/browse files/i),
+      new File(["m4a audio"], "trial.m4a", { type: "audio/mp4" }),
+    );
+    await user.click(screen.getByRole("button", { name: /analyze audio/i }));
+
+    expect(await screen.findByText("Spoken language")).toBeVisible();
+    expect(screen.getByText("Hindi")).toBeVisible();
+    expect(screen.getByText("88%")).toBeVisible();
+  });
+
+  it("omits the language card when the service returns no language", async () => {
+    const user = userEvent.setup();
+    mockAnalyzer();
+    renderApp();
+
+    await user.upload(
+      screen.getByLabelText(/browse files/i),
+      new File(["m4a audio"], "trial.m4a", { type: "audio/mp4" }),
+    );
+    await user.click(screen.getByRole("button", { name: /analyze audio/i }));
+
+    expect(await screen.findByRole("heading", { name: /contact attributes/i })).toBeVisible();
+    expect(screen.queryByText("Spoken language")).toBeNull();
   });
 
   it("requires retention acknowledgement and sends consent headers for stored audio", async () => {
@@ -237,13 +275,13 @@ describe("Audio analyzer", () => {
     };
     const fetchMock = vi.fn((url, options = {}) => {
       if (url === "/api/readyz") return Promise.resolve(response({ status: "ready" }));
-      if (url === "/api/persistence/capabilities") {
+      if (url === "/api/v1/persistence/capabilities") {
         return Promise.resolve(response(persistenceCapabilities));
       }
-      if (url === "/api/analyses" && !options.method) {
+      if (url === "/api/v1/analyses" && !options.method) {
         return Promise.resolve(response({ analyses: [stored] }));
       }
-      if (url === "/api/analyses/analysis-history-7" && !options.method) {
+      if (url === "/api/v1/analyses/analysis-history-7" && !options.method) {
         return Promise.resolve(response({
           ...stored,
           segments: [
@@ -266,7 +304,7 @@ describe("Audio analyzer", () => {
           ],
         }));
       }
-      if (url === "/api/analyses/analysis-history-7" && options.method === "DELETE") {
+      if (url === "/api/v1/analyses/analysis-history-7" && options.method === "DELETE") {
         return Promise.resolve(response(null, { status: 204 }));
       }
       return Promise.resolve(response(successfulResult));
@@ -284,14 +322,14 @@ describe("Audio analyzer", () => {
 
     await user.click(screen.getByRole("button", { name: /^delete$/i }));
     expect(fetchMock).not.toHaveBeenCalledWith(
-      "/api/analyses/analysis-history-7",
+      "/api/v1/analyses/analysis-history-7",
       expect.objectContaining({ method: "DELETE" }),
     );
     await user.click(screen.getByRole("button", { name: /confirm delete/i }));
 
     await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
-        "/api/analyses/analysis-history-7",
+        "/api/v1/analyses/analysis-history-7",
         expect.objectContaining({ method: "DELETE" }),
       );
     });
@@ -314,11 +352,11 @@ describe("Audio analyzer", () => {
     };
     const fetchMock = vi.fn((url) => {
       if (url === "/api/readyz") return Promise.resolve(response({ status: "ready" }));
-      if (url === "/api/persistence/capabilities") {
+      if (url === "/api/v1/persistence/capabilities") {
         return Promise.resolve(response(persistenceCapabilities));
       }
-      if (url === "/api/analyses") return Promise.resolve(response({ items: [stored] }));
-      if (url === "/api/analyses/analysis-result-only") {
+      if (url === "/api/v1/analyses") return Promise.resolve(response({ items: [stored] }));
+      if (url === "/api/v1/analyses/analysis-result-only") {
         return Promise.resolve(response({ ...stored, segments: [] }));
       }
       return Promise.resolve(response(successfulResult));

@@ -17,6 +17,8 @@ The result was not clean evidence that the gender head predicted incorrectly. Th
 
 Codec choice is now an observability fact, not an automatic quality failure. Narrow bandwidth, insufficient voiced speech, poor SNR, clipping, and other measured signal problems can still produce `degraded` or `insufficient`.
 
+The confidence handling that produced that result has since been reworked (see ADR-001): quality no longer scales confidence, age uncertainty includes per-sample ensemble spread and an extrapolation term, and the gender head's missing calibration is now explicit rather than silent. Investigating it also confirmed that the pinned griko SVM was fitted with `probability=False`, so the baseline has never had a calibrated gender probability — which raises the priority of the production head below, since calibration is one of its deliverables rather than an optional extra.
+
 ## Ranked options
 
 | Option | Evidence and fit | Decision |

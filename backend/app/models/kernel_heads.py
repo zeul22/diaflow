@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import math
 from pathlib import Path
 
@@ -7,6 +8,8 @@ import numpy as np
 import numpy.typing as npt
 
 from app.models.base import RawAttributes
+
+logger = logging.getLogger(__name__)
 
 
 def _scalar(array: npt.NDArray[np.generic]) -> object:
@@ -44,10 +47,20 @@ def _sigmoid(value: float) -> float:
 class KernelHeadBundle:
     """Safe NumPy runtime for build-time converted scikit-learn heads."""
 
-    def __init__(self, artifact_path: Path) -> None:
+    def __init__(
+        self, artifact_path: Path, *, require_calibrated_gender: bool = True
+    ) -> None:
         if not artifact_path.is_file():
             raise FileNotFoundError(f"Missing converted head artifact: {artifact_path}")
         with np.load(artifact_path, allow_pickle=False) as data:
+            if "gender_probability_calibrated" not in data:
+                raise RuntimeError(
+                    "The head artifact predates the gender calibration flag; "
+                    "rebuild it with backend/scripts/prepare_models.py"
+                )
+            self.gender_probability_calibrated = bool(
+                _scalar(data["gender_probability_calibrated"])
+            )
             self.gender_transform_matrix = data["gender_transform_matrix"].astype(
                 np.float64
             )
@@ -82,6 +95,29 @@ class KernelHeadBundle:
             self.age_coef0 = float(_scalar(data["age_coef0"]))
             self.age_degree = int(_scalar(data["age_degree"]))
         self._validate()
+        if not self.gender_probability_calibrated:
+            # Without the source classifier's Platt mapping the sigmoid below is
+            # only monotonic in the decision value, so the configured gender
+            # threshold is really a margin threshold.
+            if require_calibrated_gender:
+                raise RuntimeError(
+                    "The gender head artifact carries no probability calibration. "
+                    "Rebuild from a source classifier exposing predict_proba, or "
+                    "set REQUIRE_CALIBRATED_GENDER=false for evaluation."
+                )
+            logger.warning(
+                "gender_probability_uncalibrated",
+                extra={
+                    "event_data": {
+                        "artifact": str(artifact_path),
+                        "detail": (
+                            "Gender confidence is a monotonic margin score, not a "
+                            "calibrated probability. GENDER_CONFIDENCE_THRESHOLD "
+                            "acts as a decision-margin cut-off."
+                        ),
+                    }
+                },
+            )
 
     def _validate(self) -> None:
         if self.gender_transform_matrix.shape[0] != 192:
