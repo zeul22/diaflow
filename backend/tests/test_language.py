@@ -139,6 +139,7 @@ def test_language_field_is_absent_when_the_deployment_disables_it(client) -> Non
 
 
 def test_language_is_reported_when_enabled(settings) -> None:
+    # Six seconds: above LANGUAGE_MIN_SECONDS, so the classifier is consulted.
     identifier = FakeIdentifier(code="hi", confidence=0.88)
     app = create_app(
         settings=settings,
@@ -149,7 +150,7 @@ def test_language_is_reported_when_enabled(settings) -> None:
     with TestClient(app) as client:
         response = client.post(
             "/analyze",
-            content=wav_bytes(speechlike_pcm()),
+            content=wav_bytes(speechlike_pcm(6.0)),
             headers={"Content-Type": "audio/wav"},
         )
 
@@ -169,7 +170,7 @@ def test_low_confidence_language_is_withheld_rather_than_guessed(settings) -> No
     with TestClient(app) as client:
         response = client.post(
             "/analyze",
-            content=wav_bytes(speechlike_pcm()),
+            content=wav_bytes(speechlike_pcm(6.0)),
             headers={"Content-Type": "audio/wav"},
         )
 
@@ -254,9 +255,17 @@ def test_a_mid_session_language_switch_is_reflected_live(settings) -> None:
         language_pool=EstimatorPool([identifier]),
     )
 
-    predictions = _stream_languages(app)
+    predictions = _stream_languages(app, chunks=12)
 
-    languages = [item["language"]["prediction"] for item in predictions]
+    # Early updates report `unknown`: under LANGUAGE_MIN_SECONDS the classifier
+    # is not consulted, so nothing is determined rather than guessed. Only the
+    # determined answers are compared here.
+    languages = [
+        item["language"]["prediction"]
+        for item in predictions
+        if item.get("language") and item["language"]["prediction"] != "unknown"
+    ]
+    assert languages, "no update ever accumulated enough audio for a language"
     assert languages[0] == "en"
     assert languages[-1] == "hi"
     assert predictions[-1]["language"]["confidence"] == 0.77
@@ -285,3 +294,153 @@ def test_language_backend_configuration_is_validated() -> None:
         replace(Settings(), language_backend="guess").validate()
     with pytest.raises(ValueError, match="LANGUAGE_CONFIDENCE_THRESHOLD"):
         replace(Settings(), language_confidence_threshold=1.4).validate()
+
+
+def test_short_audio_never_reaches_the_language_model(settings) -> None:
+    """Below five seconds this model is confidently wrong, not just uncertain.
+
+    Measured on real English speech: two seconds returned Pashto at 0.429 and
+    three seconds returned Latin at 0.929. A confidence threshold cannot filter a
+    0.929, so short audio must not be shown to the classifier at all.
+    """
+
+    identifier = FakeIdentifier()
+    app = create_app(
+        settings=settings,
+        estimator=FakeEstimator(),
+        language_pool=EstimatorPool([identifier]),
+    )
+
+    with TestClient(app) as client:
+        short = client.post(
+            "/v1/analyze",
+            content=wav_bytes(speechlike_pcm(3.0)),
+            headers={"Content-Type": "audio/wav"},
+        ).json()
+        long = client.post(
+            "/v1/analyze",
+            content=wav_bytes(speechlike_pcm(6.0)),
+            headers={"Content-Type": "audio/wav"},
+        ).json()
+        metrics = client.get("/metrics").text
+
+    # `unknown`, not absent: the deployment does language identification, it
+    # just could not determine one. Absent is reserved for "not configured".
+    assert short["language"] == {"prediction": "unknown", "confidence": 0.0}
+    assert long["language"]["prediction"] == "en"
+    # The classifier ran once, for the long clip only.
+    assert identifier.calls == 1
+    assert 'voice_attribute_language_skipped_total{reason="too_short"} 1.0' in metrics
+
+
+def test_legacy_iso_codes_are_normalised() -> None:
+    """VoxLingua107 ships superseded tags; "IW" in a UI is not a language."""
+
+    assert parse_language_code("iw: Hebrew") == "he"
+    assert parse_language_code("jw: Javanese") == "jv"
+    assert parse_language_code("in: Indonesian") == "id"
+    assert parse_language_code("en: English") == "en"
+
+
+# Real posteriors measured on a 3-second window of genuine English speech.
+# Latin wins outright across all 107 classes; English is present but tiny.
+_THREE_SECOND_ENGLISH = {"la": 0.929, "en": 0.033, "nn": 0.006, "hi": 0.001}
+
+
+def _measured(mapping, allowed=(), threshold=0.50, margin_ratio=2.0):
+    labels = tuple(f"{code}: X" for code in mapping)
+    values = np.asarray(list(mapping.values()), dtype=np.float64)
+    return decide_language(
+        values,
+        labels,
+        threshold=threshold,
+        margin_ratio=margin_ratio,
+        allowed=allowed,
+    )
+
+
+def test_allowlist_removes_languages_a_deployment_will_never_hear() -> None:
+    """Latin beat English 0.929 to 0.033 on real English speech.
+
+    No logistics caller speaks Latin, but the class still competes and wins.
+    Restricting contention to the deployment's languages is what fixes that.
+    """
+
+    # Unrestricted, the model names Latin.
+    assert _measured(_THREE_SECOND_ENGLISH).code == "la"
+    # Restricted, Latin cannot win -- but the evidence is still too weak to
+    # name anything, so the honest answer is abstention rather than English.
+    assert (
+        _measured(_THREE_SECOND_ENGLISH, allowed=("en", "hi", "ta")).code == "unknown"
+    )
+
+
+def test_the_floor_applies_to_the_raw_posterior_not_a_renormalized_one() -> None:
+    """Renormalizing over a subset inflates confidence without new evidence.
+
+    That 3-second window renormalizes to English at 0.945 from a raw 0.033.
+    Reporting 0.945 would be a fabricated number.
+    """
+
+    estimate = _measured(_THREE_SECOND_ENGLISH, allowed=("en", "hi"), threshold=0.02)
+
+    assert estimate.code == "en"
+    # The raw posterior, not the 0.945 the subset would renormalize to.
+    assert estimate.confidence == pytest.approx(0.033)
+
+
+def test_allowlist_keeps_a_confident_answer() -> None:
+    measured = {"en": 0.641, "nl": 0.075, "la": 0.060, "hi": 0.001}
+
+    assert _measured(measured, allowed=("en", "hi", "ta")).code == "en"
+    assert _measured(measured).code == "en"
+
+
+def test_a_single_entry_allowlist_is_rejected() -> None:
+    """One permitted language means the answer is predetermined, not measured."""
+
+    assert _measured(_THREE_SECOND_ENGLISH, allowed=("en",)).code == "unknown"
+    with pytest.raises(ValueError, match="LANGUAGE_ALLOWLIST"):
+        replace(Settings(), language_allowlist=("en",)).validate()
+    with pytest.raises(ValueError, match="LANGUAGE_ALLOWLIST"):
+        replace(Settings(), language_allowlist=("en", "!!")).validate()
+
+
+def test_allowlist_floor_measures_mass_in_the_served_languages() -> None:
+    """The floor should ask whether this is a language you serve.
+
+    Judging one class against the full 107-way distribution is too strict once
+    96 of those classes are impossible: English at 0.45 is 48x chance level yet
+    a flat 0.50 floor rejects it. With an allowlist the floor is applied to the
+    permitted mass instead -- which is not renormalization, because the reported
+    confidence is still the raw posterior.
+    """
+
+    # English clearly leads, but no single class reaches 0.50.
+    spread = {"en": 0.45, "hi": 0.05, "ta": 0.02, "la": 0.30, "cy": 0.18}
+
+    # Without an allowlist the flat floor rejects a perfectly good answer.
+    assert _measured(spread).code == "unknown"
+
+    # With one, the permitted mass is 0.52 and English wins it by 9x.
+    estimate = _measured(spread, allowed=("en", "hi", "ta"))
+    assert estimate.code == "en"
+    assert estimate.confidence == pytest.approx(0.45)
+
+
+def test_mass_outside_the_served_languages_still_abstains() -> None:
+    """If the model thinks it is hearing something you do not serve, say so."""
+
+    # Almost all the mass sits in excluded classes.
+    elsewhere = {"en": 0.04, "hi": 0.01, "la": 0.60, "cy": 0.35}
+
+    assert _measured(elsewhere, allowed=("en", "hi")).code == "unknown"
+
+
+def test_ambiguity_between_served_languages_abstains() -> None:
+    """A near-tie between two languages you serve is exactly when to abstain."""
+
+    tie = {"en": 0.40, "hi": 0.38, "ta": 0.02, "la": 0.20}
+
+    # Plenty of permitted mass, but the margin rule refuses the coin flip.
+    assert _measured(tie, allowed=("en", "hi", "ta")).code == "unknown"

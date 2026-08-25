@@ -18,6 +18,11 @@ logger = logging.getLogger(__name__)
 # The upstream label encoder stores entries as "en: English".
 _LABEL_PATTERN = re.compile(r"^([A-Za-z-]{2,8})\s*:")
 
+# VoxLingua107 uses superseded ISO 639-1 codes for three languages. Emitting
+# them verbatim shows callers "IW" instead of Hebrew, so they are normalised to
+# the current tags at the boundary.
+_LEGACY_CODES = {"iw": "he", "jw": "jv", "in": "id", "ji": "yi"}
+
 
 @dataclass(frozen=True, slots=True)
 class LanguageEstimate:
@@ -41,7 +46,8 @@ def parse_language_code(label: str) -> str:
     match = _LABEL_PATTERN.match(label.strip())
     if match is None:
         return "unknown"
-    return match.group(1).lower()
+    code = match.group(1).lower()
+    return _LEGACY_CODES.get(code, code)
 
 
 def decide_language(
@@ -50,6 +56,7 @@ def decide_language(
     *,
     threshold: float,
     margin_ratio: float,
+    allowed: Sequence[str] = (),
 ) -> LanguageEstimate:
     """Accept a language only when the top class also beats the runner-up.
 
@@ -58,6 +65,18 @@ def decide_language(
     0.5 while still leading the runner-up several times over. Requiring both a
     floor and a margin keeps genuinely ambiguous audio abstaining without
     discarding a clear winner just because the absolute posterior is diffuse.
+
+    ``allowed`` restricts the answer to the languages a deployment actually
+    serves. Most of the model's absurd outputs come from classes no logistics
+    caller will ever speak: measured on real English, a 3-second window scored
+    Latin at 0.929 while English sat at 0.033. Removing implausible classes from
+    contention fixes that, and the winner is then chosen among the rest.
+
+    **The floor is still applied to the raw posterior, never to a renormalized
+    one.** Renormalizing over a subset inflates confidence without adding any
+    evidence -- that same 3-second window renormalizes to English at 0.945 on a
+    raw score of 0.033. Restricting the candidates decides *which* language;
+    the raw posterior decides whether there is enough evidence to say anything.
 
     The returned confidence is the raw posterior, not the margin.
     """
@@ -69,11 +88,33 @@ def decide_language(
     if not np.all(np.isfinite(probabilities)):
         return LanguageEstimate(code="unknown", confidence=0.0)
 
-    order = np.argsort(probabilities)[::-1]
-    best = float(probabilities[order[0]])
-    runner_up = float(probabilities[order[1]])
-    code = parse_language_code(labels[int(order[0])])
-    if code == "unknown" or best < threshold:
+    codes = [parse_language_code(label) for label in labels]
+    candidates = list(range(len(codes)))
+    if allowed:
+        permitted = {code.lower() for code in allowed}
+        candidates = [index for index in candidates if codes[index] in permitted]
+        if len(candidates) < 2:
+            return LanguageEstimate(code="unknown", confidence=0.0)
+
+    ranked = sorted(candidates, key=lambda index: probabilities[index], reverse=True)
+    best = float(probabilities[ranked[0]])
+    runner_up = float(probabilities[ranked[1]])
+    code = codes[ranked[0]]
+    if code == "unknown":
+        return LanguageEstimate(code="unknown", confidence=0.0)
+
+    if allowed:
+        # With a declared label set the floor asks a better question: does the
+        # model believe this is one of the languages this deployment serves at
+        # all? Judging a single class against the full 107-way distribution is
+        # too strict once 96 of those classes are known to be impossible --
+        # English at 0.45 is 48x chance level, yet a flat 0.50 floor rejects it.
+        # Summing the permitted mass keeps the test honest without renormalizing,
+        # because the reported confidence is still the raw posterior.
+        evidence = float(sum(probabilities[index] for index in candidates))
+    else:
+        evidence = best
+    if evidence < threshold:
         return LanguageEstimate(code="unknown", confidence=0.0)
     if best < margin_ratio * runner_up:
         return LanguageEstimate(code="unknown", confidence=0.0)
@@ -108,6 +149,7 @@ class VoxLinguaLanguageIdentifier:
         self._sample_rate = settings.target_sample_rate
         self._threshold = settings.language_confidence_threshold
         self._margin_ratio = settings.language_margin_ratio
+        self._allowed = settings.language_allowlist
         model_root = Path(settings.model_root) / "language"
         if not (model_root / "hyperparams.yaml").is_file():
             raise FileNotFoundError(f"Missing language model under {model_root}")
@@ -156,6 +198,7 @@ class VoxLinguaLanguageIdentifier:
             self._labels,
             threshold=self._threshold,
             margin_ratio=self._margin_ratio,
+            allowed=self._allowed,
         )
 
     def warmup(self) -> None:

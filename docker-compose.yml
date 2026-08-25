@@ -53,6 +53,10 @@ services:
       # Demonstrates the optional language field. Set to "none" to drop the
       # second encoder pass and roughly halve inference latency.
       LANGUAGE_BACKEND: voxlingua_ecapa
+      # Without this, all 107 classes compete and a caller will occasionally be
+      # reported as speaking Latin or Pashto. Name the languages this deployment
+      # actually serves; everything else is removed from contention.
+      LANGUAGE_ALLOWLIST: "en,hi,ta,te,kn,ml,mr,bn,gu,pa,ur"
       QUEUE_TIMEOUT_SECONDS: "1.0"
       MAX_AUDIO_SECONDS: "30"
       MAX_UPLOAD_BYTES: "12582912"

@@ -228,7 +228,10 @@ Docker Compose provides safe CPU defaults. Important environment variables are:
 | `REQUIRE_CALIBRATED_GENDER` | `true` | Refuse to serve a gender head whose probabilities are an uncalibrated margin sigmoid. |
 | `EXPOSE_DEBUG_AGE_YEARS` | `false` | Evaluation only: return the regressor's raw age estimate so the harness can measure MAE and residual spread. Never persisted. |
 | `LANGUAGE_BACKEND` | `none` | `voxlingua_ecapa` adds a best-effort `language` field. Costs a second encoder pass (~165–205 ms); the field is absent when disabled. |
-| `LANGUAGE_CONFIDENCE_THRESHOLD` | `0.35` | Minimum top-1 posterior for a language answer. |
+| `LANGUAGE_ALLOWLIST` | *(empty = all 107)* | Comma-separated tags a deployment expects, e.g. `en,hi,ta,te,mr,bn`. Removes classes no caller will speak — measured, 3s of English scored Latin 0.929 across all 107. Strongly recommended. |
+| `LANGUAGE_MIN_SECONDS` | `5.0` | Audio below this never reaches the classifier: measured, 3s of English scored Latin at 0.929, which no threshold can filter. |
+| `LANGUAGE_WINDOW_SECONDS` | `10.0` | Audio given to language ID, taken from the decoded signal rather than the shorter attribute window. |
+| `LANGUAGE_CONFIDENCE_THRESHOLD` | `0.50` | Minimum top-1 posterior for a language answer. |
 | `LANGUAGE_MARGIN_RATIO` | `2.0` | How far the top language must lead the runner-up. Posteriors spread across 107 related languages, so a floor alone rejects correct answers. |
 | `LANGUAGE_REFRESH_SECONDS` | `3.0` | New streamed audio before the language is rechecked, so a caller switching language is followed. Lower detects switches sooner at one extra encoder pass each. |
 | `WS_EMIT_INTERVAL_SECONDS` | `1.0` | Minimum new-audio interval before the first progressive result. |
@@ -313,7 +316,7 @@ Before production, add TLS at the ingress, authentication, tenant authorization,
 - The default ECAPA/SVM/SVR model is a runnable baseline, not a logistics-domain production accuracy claim.
 - Age and perceived voice-presentation estimates can be wrong or abstain, especially for short, noisy, narrowband, accented, multilingual, or out-of-domain speech.
 - Mixed agent/caller audio is not diarized; integrations must send the caller channel only.
-- Language identification is optional, untested on telephony audio, and has no non-speech class: it will name a language for music or noise. Accent and dialect detection are not offered at all.
+- Language identification is optional, untested on telephony audio, and has no non-speech class: it will name a language for music or noise. It refuses audio under `LANGUAGE_MIN_SECONDS` outright, so a live session reports `unknown` for its first few seconds, and it should be run with `LANGUAGE_ALLOWLIST` set — without it all 107 classes compete and a caller is occasionally reported as speaking Latin or Pashto. Accuracy on accented speech is unmeasured on this project's own data. Accent and dialect detection are not offered at all.
 - The local history API has no tenant authentication, and the bundled object store is for demonstration only.
 - The WavLM production path requires an owned, evaluated ONNX artifact; public backbone weights alone do not provide the required heads or calibration.
 

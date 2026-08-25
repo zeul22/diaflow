@@ -28,9 +28,18 @@ Top-1 posterior alone is the wrong instrument across 107 classes. Measured on a 
 | `la: Latin` | 0.1155 |
 | `ca: Catalan` | 0.0580 |
 
-The answer is correct and unambiguous — it leads the runner-up by 3.7x — yet a naive 0.5 threshold rejects it, because probability mass spreads across related languages. A result is therefore accepted only when the top posterior clears `LANGUAGE_CONFIDENCE_THRESHOLD` (`0.35`) **and** exceeds the runner-up by `LANGUAGE_MARGIN_RATIO` (`2.0`). The emitted confidence is the raw posterior, not the margin. Both values are defaults chosen from a handful of observations, not from a labeled sweep, and must be re-derived on domain audio.
+The answer is correct and unambiguous — it leads the runner-up by 3.7x — yet a naive 0.5 threshold rejects it, because probability mass spreads across related languages. Two conditions are therefore required, and **what the floor is applied to depends on whether a label set is declared**:
 
-The same clip scores 0.6411 over its full 6.8 seconds versus 0.4679 on the selected 5-second window, so the attribute pipeline's deliberately narrow window costs language accuracy. Feeding language identification a longer window is a plausible improvement that was not taken here, because it would add latency to a path that is already the larger half of the budget.
+| | Floor (`LANGUAGE_CONFIDENCE_THRESHOLD`, `0.50`) | Margin (`LANGUAGE_MARGIN_RATIO`, `2.0`) |
+| --- | --- | --- |
+| No allowlist | the top class's raw posterior | over the runner-up across all 107 |
+| With allowlist | the **summed mass of the permitted languages** | over the runner-up among permitted |
+
+Testing one class against the full 107-way distribution is too strict once 96 of those classes are impossible for the deployment: English at 0.45 is 48x chance level and was being discarded. Summing the permitted mass asks the question that actually matters — *does the model believe this is a language you serve?* — without renormalizing, because **the reported confidence remains the raw posterior** either way.
+
+The floor was briefly lowered to `0.35` to admit one observed clip. That was a methodological error: a single sample cannot set an operating point. It is back at `0.50`, and the longer window plus the allowlist are what make that affordable. Both values still need re-deriving on domain audio.
+
+The same clip scores 0.6411 over its full 6.8 seconds versus 0.4679 on the selected 5-second window, so the attribute pipeline's deliberately narrow window was costing language accuracy. Language identification is therefore given its own window; see the section above.
 
 ## Cost
 
@@ -64,7 +73,9 @@ Three things add to that lag: the refresh interval, the trailing analysis window
 - **Untested on telephony.** VoxLingua107 is automatically collected YouTube speech. No narrowband, codec, packet-loss, or logistics-noise evaluation is bundled or claimed.
 - **Code-switching is detected, not modelled.** A switch is picked up after a few seconds, but the field holds one label at a time and can be transiently wrong while a window contains both languages. Simultaneous or sentence-level mixing has no representation in the contract.
 - **107 classes include closely related pairs.** Confusions inside a language family are expected and are the reason for the margin rule.
-- **Thresholds are uncalibrated**, exactly as with the attribute heads.
+- **Thresholds are uncalibrated**, exactly as with the attribute heads. The floor was initially tuned to admit a single observed clip at 0.468 -- a methodological error, since one sample cannot set an operating point. It is back at 0.50 now that longer windows make that affordable.
+- **Accent shift is a documented weakness of language identification generally**, since the model keys on phonetics and prosody, which are exactly what an accent changes. An earlier draft of this ADR claimed Indian-accented English is frequently scored as Hindi; the one accented sample available contradicts that outright -- English scored 0.6411 against Hindi at 0.0010, a 640x margin. The observed failures were window length and 107-class spread, not accent. The general weakness stands as a caveat; the specific claim was unsupported and has been withdrawn.
+- **VoxLingua107 ships superseded ISO tags** (`iw`, `jw`, `in`), which surfaced in the UI as "IW". They are normalised to `he`, `jv`, `id` at the boundary.
 
 ## Consequences
 

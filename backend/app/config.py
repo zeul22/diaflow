@@ -103,7 +103,22 @@ class Settings:
     language_backend: str = "none"
     # Posteriors spread across 107 related languages, so acceptance needs a
     # floor and a margin over the runner-up rather than a high floor alone.
-    language_confidence_threshold: float = 0.35
+    # Measured on real speech: below five seconds this model is not merely
+    # uncertain, it is *confidently wrong* -- three seconds of English scored
+    # Latin at 0.929. No threshold can defend against that, so short audio must
+    # not reach the classifier at all.
+    language_min_seconds: float = 5.0
+    # Give it more audio than the attribute window, which is capped at five
+    # seconds and selected for speech evidence rather than for language.
+    # Measured on the same clip: 0.468 at 5s versus 0.641 at 6.8s.
+    language_window_seconds: float = 10.0
+    # Languages this deployment expects to hear. Empty means all 107, which is
+    # where the absurd answers come from: a caller will never speak Latin or
+    # Interlingua, but those classes still compete and sometimes win. Restricting
+    # contention removes them; the raw-posterior floor still decides whether
+    # there is enough evidence to name anything at all.
+    language_allowlist: tuple[str, ...] = ()
+    language_confidence_threshold: float = 0.50
     language_margin_ratio: float = 2.0
     # New audio required before a streaming session re-checks the language. Zero
     # re-checks on every progressive update, at one extra encoder pass each.
@@ -296,6 +311,17 @@ class Settings:
             language_backend=os.getenv(
                 "LANGUAGE_BACKEND", defaults.language_backend
             ).lower(),
+            language_allowlist=tuple(
+                code.strip().lower()
+                for code in os.getenv("LANGUAGE_ALLOWLIST", "").split(",")
+                if code.strip()
+            ),
+            language_min_seconds=float(
+                os.getenv("LANGUAGE_MIN_SECONDS", defaults.language_min_seconds)
+            ),
+            language_window_seconds=float(
+                os.getenv("LANGUAGE_WINDOW_SECONDS", defaults.language_window_seconds)
+            ),
             language_confidence_threshold=float(
                 os.getenv(
                     "LANGUAGE_CONFIDENCE_THRESHOLD",
@@ -481,6 +507,28 @@ class Settings:
             raise ValueError("WS_REORDER_WINDOW_FRAMES must be between 1 and 256")
         if not 0.0 <= self.ws_max_loss_ratio <= 1.0:
             raise ValueError("WS_MAX_LOSS_RATIO must be between 0 and 1")
+        if len(self.language_allowlist) == 1:
+            raise ValueError(
+                "LANGUAGE_ALLOWLIST needs at least two languages to choose between"
+            )
+        for code in self.language_allowlist:
+            if not code.isalpha() or not 2 <= len(code) <= 8:
+                raise ValueError(f"LANGUAGE_ALLOWLIST entry {code!r} is not a tag")
+        if not math.isfinite(self.language_min_seconds) or not (
+            0.0 <= self.language_min_seconds <= self.max_audio_seconds
+        ):
+            raise ValueError(
+                "LANGUAGE_MIN_SECONDS must be between 0 and MAX_AUDIO_SECONDS"
+            )
+        if not math.isfinite(self.language_window_seconds) or not (
+            self.language_min_seconds
+            <= self.language_window_seconds
+            <= self.max_audio_seconds
+        ):
+            raise ValueError(
+                "LANGUAGE_WINDOW_SECONDS must be between LANGUAGE_MIN_SECONDS and "
+                "MAX_AUDIO_SECONDS"
+            )
         if not math.isfinite(self.language_margin_ratio) or (
             self.language_margin_ratio < 1.0
         ):

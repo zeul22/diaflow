@@ -7,6 +7,9 @@ from collections.abc import Callable
 from typing import Any, TypeVar
 from uuid import UUID
 
+import numpy as np
+import numpy.typing as npt
+
 from app.audio.decoder import AudioDecoder
 from app.audio.enhance import enhance_window
 from app.audio.quality import analyze_quality, prepare_inference_window
@@ -53,6 +56,21 @@ async def _thread_call(
         raise
 
 
+def _language_window(
+    samples: npt.NDArray[np.float32], settings: Settings
+) -> npt.NDArray[np.float32]:
+    """The most recent ``LANGUAGE_WINDOW_SECONDS`` of decoded audio.
+
+    The tail rather than the head, so a caller who switches language is followed
+    rather than reported as whatever they opened with.
+    """
+
+    limit = int(settings.language_window_seconds * settings.target_sample_rate)
+    if samples.size <= limit:
+        return samples
+    return samples[-limit:]
+
+
 class AnalysisService:
     def __init__(
         self,
@@ -89,6 +107,22 @@ class AnalysisService:
         pool = self._language_pool
         if pool is None:
             return None, 0.0
+        minimum = int(
+            self.settings.language_min_seconds * self.settings.target_sample_rate
+        )
+        if window.size < minimum:
+            # Below this the classifier is confidently wrong, not merely
+            # uncertain: three seconds of English measured Latin at 0.929. A
+            # confidence threshold cannot filter that, so short audio is never
+            # shown to it.
+            #
+            # Reported as `unknown`, not as an absent field: the deployment *is*
+            # configured for language, it simply could not determine one. An
+            # absent field is reserved for "this deployment does not do language
+            # identification at all", and conflating the two would make the
+            # response ambiguous for a caller.
+            self.metrics.language_skipped.labels(reason="too_short").inc()
+            return LanguagePrediction(prediction="unknown", confidence=0.0), 0.0
         try:
             identifier = await pool.acquire(self.settings.queue_timeout_seconds)
         except TimeoutError:
@@ -187,7 +221,15 @@ class AnalysisService:
             language = settled_language
             language_seconds = 0.0
             if language is None:
-                language, language_seconds = await self._identify_language(enhanced)
+                # Language identification gets its own, longer window taken from
+                # the decoded signal rather than the five-second attribute
+                # window: that window is capped and chosen for speech evidence,
+                # and more audio measurably improves language accuracy. AGC is
+                # skipped because it was measured to change the posteriors not
+                # at all.
+                language, language_seconds = await self._identify_language(
+                    _language_window(samples, self.settings)
+                )
             elapsed_ms = round((time.perf_counter() - started) * 1_000)
             logger.info(
                 "analysis_completed",

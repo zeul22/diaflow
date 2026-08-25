@@ -261,7 +261,7 @@ def test_analysis_logs_carry_no_predicted_attributes(settings, caplog) -> None:
     with caplog.at_level(logging.INFO), TestClient(app) as client:
         payload = client.post(
             "/v1/analyze",
-            content=wav_bytes(speechlike_pcm()),
+            content=wav_bytes(speechlike_pcm(6.0)),
             headers={"Content-Type": "audio/wav"},
         ).json()
         metrics = client.get("/metrics").text
